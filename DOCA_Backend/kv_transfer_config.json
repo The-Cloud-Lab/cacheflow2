@@ -1,0 +1,13 @@
+{
+    "kv_connector": "DOCAConnectorV1",
+    "kv_role": "kv_both",
+    "kv_rank": 0,
+    "kv_parallel_size": 1,
+    "kv_buffer_device": "cuda",
+    "kv_buffer_size": 1e9,
+    "kv_ip": "0.0.0.0",
+    "kv_port": 14579,
+    "doca_pci_addr": "0000:0c:00.0",
+    "doca_block_size": 16777216,
+    "doca_max_blocks": 256
+  }

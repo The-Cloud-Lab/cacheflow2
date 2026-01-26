@@ -1,0 +1,32 @@
+{
+  "comment": "Example configuration for DOCA KV Cache Offload",
+  
+  "host": {
+    "dpu_pci_address": "0000:03:00.0",
+    "server_port": 6789,
+    "max_buffers": 1024,
+    "dma_alignment": 64,
+    "timeout_ms": 5000
+  },
+  
+  "dpu": {
+    "listen_address": "0.0.0.0:6789",
+    "max_queue_depth": 128,
+    "max_buffers": 1024,
+    "worker_threads": 4
+  },
+  
+  "performance": {
+    "enable_stats": true,
+    "stats_interval_ms": 1000,
+    "log_level": "INFO",
+    "enable_bandwidth_monitoring": true
+  },
+  
+  "vllm_integration": {
+    "auto_offload_threshold_mb": 512,
+    "offload_strategy": "lru",
+    "prefetch_enabled": false,
+    "compression_enabled": false
+  }
+}

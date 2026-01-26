@@ -1,0 +1,23 @@
+"""
+DOCA KV Cache Offload for vLLM
+
+This package provides KV cache offloading to NVIDIA BlueField DPU
+using DOCA for vLLM inference.
+"""
+
+# Register the connector with vLLM when this package is imported
+# This ensures registration happens even in multiprocessing subprocesses
+from . import register_connector
+register_connector.register_doca_connector()
+
+from .doca_connector import DOCAConnectorV1
+from .kv_offload_manager import KVOffloadManager
+from .doca_kv_offload import DOCAKVOffloadClient
+
+__all__ = [
+    'DOCAConnectorV1',
+    'KVOffloadManager',
+    'DOCAKVOffloadClient',
+]
+
+__version__ = '0.1.0'

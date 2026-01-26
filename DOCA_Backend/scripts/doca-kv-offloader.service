@@ -1,0 +1,44 @@
+[Unit]
+Description=DOCA KV Cache Offloader Service
+Documentation=https://github.com/anthropics/cacheflow
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+
+# Environment
+Environment="LD_LIBRARY_PATH=/opt/mellanox/doca/lib/aarch64-linux-gnu"
+Environment="DOCA_LOG_LEVEL=INFO"
+
+# Service binary
+ExecStart=/opt/cacheflow/bin/dpu_offloader --server-name doca_kv_cache
+ExecReload=/bin/kill -HUP $MAINPID
+ExecStop=/bin/kill -TERM $MAINPID
+
+# Restart policy
+Restart=on-failure
+RestartSec=10s
+StartLimitInterval=200s
+StartLimitBurst=5
+
+# Resource limits
+LimitNOFILE=65536
+LimitNPROC=4096
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=doca-kv-offloader
+
+# Security hardening
+NoNewPrivileges=false
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/var/log/cacheflow
+
+[Install]
+WantedBy=multi-user.target

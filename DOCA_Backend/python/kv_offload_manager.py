@@ -89,7 +89,7 @@ class KVOffloadManager:
     def __init__(
         self,
         pci_addr: Optional[str] = None,
-        block_size: int = 16 * 1024 * 1024,  # 16MB default block size
+        block_size: int = 64 * 1024 * 1024,  # 64MB default block size
         max_blocks: int = 256,
         num_staging_buffers: int = 4,
         async_transfers: bool = True,

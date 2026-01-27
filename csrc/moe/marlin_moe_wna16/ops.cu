@@ -592,12 +592,16 @@ torch::Tensor moe_wna16_marlin_gemm(
   if (b_type_id == vllm::kFE2M1f.id()) {
     if (b_scales.scalar_type() == at::ScalarType::Float8_e4m3fn) {
       s_type_id = vllm::kFE4M3fn.id();
-    } else if (b_scales.scalar_type() == at::ScalarType::Float8_e8m0fnu) {
+    }
+#if defined(AT_SCALAR_TYPE_FLOAT8_E8M0FNU)
+    else if (b_scales.scalar_type() == at::ScalarType::Float8_e8m0fnu) {
       s_type_id = vllm::kFE8M0fnu.id();
-    } else {
+    }
+#endif
+    else {
       TORCH_CHECK(false,
                   "When b_type = float4_e2m1f, b_scale scalar type must be",
-                  "float8_e4m3fn (for NVFP4) or float8_e8m0fnu (for MXFP4).");
+                  "float8_e4m3fn (for NVFP4).");
     }
   }
 

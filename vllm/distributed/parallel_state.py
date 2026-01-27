@@ -33,7 +33,7 @@ from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import timedelta
 from multiprocessing import shared_memory
-from typing import Any, Optional
+from typing import Any, List, Optional
 from unittest.mock import patch
 
 import torch
@@ -170,10 +170,10 @@ def patched_fused_scaled_matmul_reduce_scatter_fake(
     orig_scatter_dim: int,
     scatter_dim_after_maybe_reshape: int,
     group_name: str,
-    output_shape: list[int],
-    bias: torch.Tensor | None = None,
-    result_scale: torch.Tensor | None = None,
-    out_dtype: torch.dtype | None = None,
+    output_shape: List[int],
+    bias: Optional[torch.Tensor] = None,
+    result_scale: Optional[torch.Tensor] = None,
+    out_dtype: Optional[torch.dtype] = None,
     use_fast_accum: bool = False,
 ) -> torch.Tensor:
     # Copied from
@@ -222,10 +222,10 @@ def patched_fused_scaled_matmul_reduce_scatter(
     orig_scatter_dim: int,
     scatter_dim_after_maybe_reshape: int,
     group_name: str,
-    output_shape: list[int],
-    bias: torch.Tensor | None = None,
-    result_scale: torch.Tensor | None = None,
-    out_dtype: torch.dtype | None = None,
+    output_shape: List[int],
+    bias: Optional[torch.Tensor] = None,
+    result_scale: Optional[torch.Tensor] = None,
+    out_dtype: Optional[torch.dtype] = None,
     use_fast_accum: bool = False,
 ) -> torch.Tensor:
     return torch.ops.symm_mem.fused_scaled_matmul_reduce_scatter(

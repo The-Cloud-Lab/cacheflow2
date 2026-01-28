@@ -30,6 +30,7 @@ struct dpu_buffer {
     struct doca_mmap *remote_mmap;  // Imported host memory
     struct doca_mmap *local_mmap;   // Local DPU memory
     void *local_addr;               // Local buffer address
+    bool local_addr_is_mmap;        // True if local_addr came from mmap()
     bool registered;
 };
 

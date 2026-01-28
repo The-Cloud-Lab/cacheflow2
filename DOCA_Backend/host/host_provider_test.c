@@ -39,15 +39,13 @@ int main(int argc, char **argv) {
     doca_error_t result;
     host_provider_t *provider = NULL;
     const char *pci_addr = DEFAULT_DPU_PCI;
-    size_t buffer_size;
     void *buffer;
     uint32_t *data;
     size_t i;
     uint64_t buffer_id, transfer_id;
-    const int num_transfers = 5;
-    size_t chunk_size;
-    int j;
     transfer_stats_t stats;
+    const size_t test_sizes[] = { 2 * 1024 * 1024, 4 * 1024 * 1024 };
+    const uint32_t timeout_ms = 60000;
     
     if (argc > 1) {
         pci_addr = argv[1];
@@ -82,86 +80,87 @@ int main(int argc, char **argv) {
     
     DOCA_LOG_INFO("✓ Host provider initialized");
     
-    /* Test 1: Register and transfer a buffer */
-    DOCA_LOG_INFO("\n=== Test 1: Single Buffer Transfer ===");
-    
-    buffer_size = 4096; /* Start with 4 KB to test DMA */
-    buffer = allocate_pinned_memory(buffer_size);
-    if (!buffer) {
-        DOCA_LOG_ERR("Failed to allocate pinned memory");
-        host_provider_destroy(provider);
-        return 1;
-    }
-    
-    /* Fill buffer with test pattern */
-    DOCA_LOG_INFO("Filling buffer with test pattern...");
-    data = (uint32_t *)buffer;
-    for (i = 0; i < buffer_size / sizeof(uint32_t); i++) {
-        data[i] = i;
-    }
-    
-    /* Register buffer */
-    DOCA_LOG_INFO("Registering buffer (%zu bytes)...", buffer_size);
-    result = host_provider_register_buffer(provider, buffer, buffer_size, &buffer_id);
-    if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Failed to register buffer");
-        free_pinned_memory(buffer, buffer_size);
-        host_provider_destroy(provider);
-        return 1;
-    }
-    
-    DOCA_LOG_INFO("✓ Buffer registered with ID: %lu", buffer_id);
-    
-    /* Transfer buffer */
-    DOCA_LOG_INFO("Transferring buffer to DPU...");
-    result = host_provider_transfer(provider, buffer_id, 0, buffer_size, &transfer_id);
-    if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Failed to initiate transfer");
+    for (size_t t = 0; t < sizeof(test_sizes) / sizeof(test_sizes[0]); t++) {
+        size_t buffer_size = test_sizes[t];
+
+        DOCA_LOG_INFO("\n=== Test: Host->DPU and DPU->Host (%zu bytes) ===", buffer_size);
+
+        buffer = allocate_pinned_memory(buffer_size);
+        if (!buffer) {
+            DOCA_LOG_ERR("Failed to allocate pinned memory");
+            host_provider_destroy(provider);
+            return 1;
+        }
+
+        /* Fill buffer with test pattern */
+        DOCA_LOG_INFO("Filling buffer with test pattern...");
+        data = (uint32_t *)buffer;
+        for (i = 0; i < buffer_size / sizeof(uint32_t); i++) {
+            data[i] = (uint32_t)i;
+        }
+
+        /* Register buffer */
+        DOCA_LOG_INFO("Registering buffer (%zu bytes)...", buffer_size);
+        result = host_provider_register_buffer(provider, buffer, buffer_size, &buffer_id);
+        if (result != DOCA_SUCCESS) {
+            DOCA_LOG_ERR("Failed to register buffer");
+            free_pinned_memory(buffer, buffer_size);
+            host_provider_destroy(provider);
+            return 1;
+        }
+
+        DOCA_LOG_INFO("✓ Buffer registered with ID: %lu", buffer_id);
+
+        /* Host -> DPU transfer */
+        DOCA_LOG_INFO("Transferring buffer to DPU...");
+        result = host_provider_transfer(provider, buffer_id, 0, buffer_size, &transfer_id);
+        if (result != DOCA_SUCCESS) {
+            DOCA_LOG_ERR("Failed to initiate transfer");
+            host_provider_unregister_buffer(provider, buffer_id);
+            free_pinned_memory(buffer, buffer_size);
+            host_provider_destroy(provider);
+            return 1;
+        }
+
+        DOCA_LOG_INFO("Transfer initiated with ID: %lu", transfer_id);
+        DOCA_LOG_INFO("Waiting for transfer to complete...");
+        result = host_provider_wait_transfer(provider, transfer_id, timeout_ms);
+        if (result != DOCA_SUCCESS) {
+            DOCA_LOG_ERR("Transfer failed or timed out");
+            host_provider_unregister_buffer(provider, buffer_id);
+            free_pinned_memory(buffer, buffer_size);
+            host_provider_destroy(provider);
+            return 1;
+        }
+        DOCA_LOG_INFO("✓ Host->DPU transfer completed successfully");
+
+        /* DPU -> Host load */
+        DOCA_LOG_INFO("Loading buffer back to host (DPU->Host)...");
+        result = host_provider_load(provider, buffer_id, 0, buffer_size, &transfer_id);
+        if (result != DOCA_SUCCESS) {
+            DOCA_LOG_ERR("Failed to initiate load");
+            host_provider_unregister_buffer(provider, buffer_id);
+            free_pinned_memory(buffer, buffer_size);
+            host_provider_destroy(provider);
+            return 1;
+        }
+
+        DOCA_LOG_INFO("Load initiated with ID: %lu", transfer_id);
+        DOCA_LOG_INFO("Waiting for load to complete...");
+        result = host_provider_wait_transfer(provider, transfer_id, timeout_ms);
+        if (result != DOCA_SUCCESS) {
+            DOCA_LOG_ERR("Load failed or timed out");
+            host_provider_unregister_buffer(provider, buffer_id);
+            free_pinned_memory(buffer, buffer_size);
+            host_provider_destroy(provider);
+            return 1;
+        }
+        DOCA_LOG_INFO("✓ DPU->Host load completed successfully");
+
+        DOCA_LOG_INFO("Unregistering buffer...");
         host_provider_unregister_buffer(provider, buffer_id);
         free_pinned_memory(buffer, buffer_size);
-        host_provider_destroy(provider);
-        return 1;
     }
-    
-    DOCA_LOG_INFO("Transfer initiated with ID: %lu", transfer_id);
-    
-    /* Wait for completion */
-    DOCA_LOG_INFO("Waiting for transfer to complete...");
-    result = host_provider_wait_transfer(provider, transfer_id, 10000);
-    if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Transfer failed or timed out");
-        host_provider_unregister_buffer(provider, buffer_id);
-        free_pinned_memory(buffer, buffer_size);
-        host_provider_destroy(provider);
-        return 1;
-    }
-    
-    DOCA_LOG_INFO("✓ Transfer completed successfully");
-    
-    /* Test 2: Multiple transfers */
-    DOCA_LOG_INFO("\n=== Test 2: Multiple Sequential Transfers ===");
-    
-    chunk_size = buffer_size / num_transfers;
-    
-    for (j = 0; j < num_transfers; j++) {
-        DOCA_LOG_INFO("Transfer %d/%d (offset=%zu, size=%zu)...", 
-                 j + 1, num_transfers, j * chunk_size, chunk_size);
-        
-        result = host_provider_transfer(provider, buffer_id, j * chunk_size, 
-                                       chunk_size, &transfer_id);
-        if (result != DOCA_SUCCESS) {
-            DOCA_LOG_ERR("Failed to initiate transfer %d", j);
-            break;
-        }
-        
-        result = host_provider_wait_transfer(provider, transfer_id, 10000);
-        if (result != DOCA_SUCCESS) {
-            DOCA_LOG_ERR("Transfer %d failed", j);
-            break;
-        }
-    }
-    
-    DOCA_LOG_INFO("✓ All transfers completed");
     
     /* Get statistics */
     DOCA_LOG_INFO("\n=== Transfer Statistics ===");
@@ -176,10 +175,6 @@ int main(int argc, char **argv) {
     
     /* Cleanup */
     DOCA_LOG_INFO("\n=== Cleanup ===");
-    DOCA_LOG_INFO("Unregistering buffer...");
-    host_provider_unregister_buffer(provider, buffer_id);
-    free_pinned_memory(buffer, buffer_size);
-    
     DOCA_LOG_INFO("Destroying provider...");
     host_provider_destroy(provider);
     

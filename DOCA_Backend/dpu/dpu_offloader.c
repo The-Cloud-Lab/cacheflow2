@@ -57,6 +57,13 @@ static void destroy_dpu_buffer(dpu_buffer_t *buf) {
     if (!buf) return;
     if (buf->local_mmap) doca_mmap_destroy(buf->local_mmap);
     if (buf->remote_mmap) doca_mmap_destroy(buf->remote_mmap);
+    if (buf->local_addr) {
+        if (buf->local_addr_is_mmap) {
+            munmap(buf->local_addr, buf->size);
+        } else {
+            free(buf->local_addr);
+        }
+    }
     free(buf);
 }
 
@@ -301,6 +308,9 @@ static doca_error_t handle_buffer_registration(dpu_offloader_t *off, buffer_regi
             free(buf);
             return DOCA_ERROR_NO_MEMORY;
         }
+        buf->local_addr_is_mmap = false;
+    } else {
+        buf->local_addr_is_mmap = true;
     }
 
     DOCA_LOG_INFO("Allocated local buffer at %p (size=%zu)", buf->local_addr, reg->size);

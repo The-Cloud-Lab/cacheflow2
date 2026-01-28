@@ -260,10 +260,8 @@ class KVOffloadManager:
             if sync:
                 self._doca_client.wait_transfer(transfer_id)
                 block.state = BlockState.ON_DPU
-
-                # We can release the pinned buffer now
-                self._buffer_pool.release(pinned_buf)
-                block.pinned_buffer = None
+                # Keep pinned buffer alive while data is on DPU.
+                # DPU->Host load writes into this same buffer.
             else:
                 # Store transfer_id for later completion check
                 block._pending_transfer_id = transfer_id
@@ -336,15 +334,20 @@ class KVOffloadManager:
             if block.state != BlockState.ON_DPU:
                 raise RuntimeError(f"Block {block_id} in invalid state: {block.state}")
 
-            # For now, we need the pinned buffer to still hold the data
-            # Full DPU->Host fetch would require bidirectional DMA (future)
             if block.pinned_buffer is None:
                 raise RuntimeError(
                     "Block data not in pinned buffer. "
-                    "DPU->Host fetch not yet implemented."
+                    "Cannot perform DPU->Host load."
                 )
 
             block.state = BlockState.TRANSFERRING_TO_GPU
+
+            # DPU -> Host (pinned)
+            transfer_id = self._doca_client.load(
+                block.buffer_id, offset=0, length=size
+            )
+            if sync:
+                self._doca_client.wait_transfer(transfer_id)
 
             # Copy Host -> GPU
             CUDARuntime.memcpy_htod(

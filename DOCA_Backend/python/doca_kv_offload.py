@@ -163,6 +163,12 @@ class DOCAKVOffloadClient:
         ]
         lib.host_provider_transfer.restype = c_uint32
 
+        # host_provider_load
+        lib.host_provider_load.argtypes = [
+            c_void_p, c_uint64, c_uint64, c_size_t, POINTER(c_uint64)
+        ]
+        lib.host_provider_load.restype = c_uint32
+
         # host_provider_wait_transfer
         lib.host_provider_wait_transfer.argtypes = [
             c_void_p, c_uint64, c_uint32
@@ -261,6 +267,47 @@ class DOCAKVOffloadClient:
 
         return transfer_id.value
 
+    def load(self, buffer_id: int, offset: int = 0,
+             length: Optional[int] = None) -> int:
+        """
+        Request a DMA load from DPU to host.
+
+        Args:
+            buffer_id: ID of the registered buffer
+            offset: Offset within the buffer (bytes)
+            length: Number of bytes to load (None = entire buffer from offset)
+
+        Returns:
+            transfer_id: ID for tracking the load
+        """
+        if self._provider is None:
+            raise RuntimeError("Provider not initialized")
+
+        if buffer_id not in self._registered_buffers:
+            raise ValueError(f"Buffer {buffer_id} not registered")
+
+        _, buf_size = self._registered_buffers[buffer_id]
+        if length is None:
+            length = buf_size - offset
+
+        if offset + length > buf_size:
+            raise ValueError(
+                f"Load exceeds buffer size: offset={offset}, "
+                f"length={length}, buffer_size={buf_size}"
+            )
+
+        transfer_id = c_uint64()
+        result = self._lib.host_provider_load(
+            self._provider,
+            c_uint64(buffer_id),
+            c_uint64(offset),
+            c_size_t(length),
+            byref(transfer_id)
+        )
+        DOCAError.check(result, f"Failed to initiate load for buffer {buffer_id}")
+
+        return transfer_id.value
+
     def wait_transfer(self, transfer_id: int, timeout_ms: int = 5000) -> None:
         """
         Wait for a transfer to complete.
@@ -295,6 +342,21 @@ class DOCAKVOffloadClient:
             timeout_ms: Timeout in milliseconds
         """
         transfer_id = self.transfer(buffer_id, offset, length)
+        self.wait_transfer(transfer_id, timeout_ms)
+
+    def load_sync(self, buffer_id: int, offset: int = 0,
+                  length: Optional[int] = None,
+                  timeout_ms: int = 5000) -> None:
+        """
+        Synchronous load: initiate and wait for completion.
+
+        Args:
+            buffer_id: ID of the registered buffer
+            offset: Offset within the buffer
+            length: Number of bytes to load
+            timeout_ms: Timeout in milliseconds
+        """
+        transfer_id = self.load(buffer_id, offset, length)
         self.wait_transfer(transfer_id, timeout_ms)
 
     def unregister_buffer(self, buffer_id: int) -> None:

@@ -276,6 +276,13 @@ async def send_request(
                     latency = time.perf_counter_ns() - start_time
                 elif stream is False:
                     data = json.loads(chunk)
+                    if "choices" not in data:
+                        valid_response = False
+                        logger.warning(
+                            f"{Color.YELLOW}Non-stream response missing choices: "
+                            f"{data}{Color.RESET}"
+                        )
+                        break
                     message = data["choices"][0]["message"]
                     assert message["role"] == "assistant"
                     generated_text += message["content"]
@@ -284,6 +291,13 @@ async def send_request(
                     data = json.loads(chunk)
 
                     # Delta is the new content/text/data
+                    if "choices" not in data:
+                        valid_response = False
+                        logger.warning(
+                            f"{Color.YELLOW}Stream response missing choices: "
+                            f"{data}{Color.RESET}"
+                        )
+                        break
                     delta = data["choices"][0]["delta"]
                     if delta.get("content", None):
                         if ttft is None:

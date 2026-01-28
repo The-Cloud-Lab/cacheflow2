@@ -42,6 +42,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 )
 from vllm.logger import init_logger
 from vllm.v1.attention.backend import AttentionMetadata
+from vllm.model_executor.layers.attention.mla_attention import MLACommonMetadata
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.outputs import KVConnectorOutput
 
@@ -56,7 +57,10 @@ logger = init_logger(__name__)
 
 def compute_prefix_hash(token_ids: list[int], num_tokens: int) -> str:
     """Compute a hash for a token prefix."""
-    prefix = tuple(token_ids[:num_tokens])
+    if num_tokens <= 0:
+        prefix = ()
+    else:
+        prefix = tuple(token_ids[:num_tokens])
     return hashlib.sha256(str(prefix).encode()).hexdigest()[:16]
 
 
@@ -108,6 +112,7 @@ class RequestTracker:
     allocated_block_ids: list[int]
     num_saved_tokens: int = 0
     prefix_hash: Optional[str] = None
+    cached_tokens: int = 0
     is_loading: bool = False
     is_saving: bool = False
     dpu_block_id: Optional[int] = None
@@ -210,6 +215,13 @@ class CacheFlowConnectorV1(KVConnectorBase_V1):
         self.num_staging_buffers = extra_config.get('num_staging_buffers', 4)
         self.async_transfers = extra_config.get('async_transfers', True)
         self.tokens_per_block = extra_config.get('tokens_per_block', 1024)
+        self.common_prefix_num_tokens = extra_config.get(
+            'common_prefix_num_tokens', 0
+        )
+        self._load_prefix_map_enabled = bool(
+            extra_config.get("load_prefix_map", False)
+        )
+        self._prefix_map_mtime: float | None = None
 
         # Model configuration
         self.num_layers = vllm_config.model_config.get_num_layers(
@@ -260,7 +272,7 @@ class CacheFlowConnectorV1(KVConnectorBase_V1):
         }
 
         self._prefix_map_path = self._get_prefix_map_path(extra_config)
-        self._load_prefix_map()
+        self._load_prefix_map(extra_config)
 
         logger.info(
             f"CacheFlowConnectorV1 initialized: role={role.name}, "
@@ -278,10 +290,13 @@ class CacheFlowConnectorV1(KVConnectorBase_V1):
             return path
         return os.path.join("/tmp", "cacheflow_prefix_map.json")
 
-    def _load_prefix_map(self) -> None:
+    def _load_prefix_map(self, extra_config: dict[str, Any]) -> None:
+        if not extra_config.get("load_prefix_map", False):
+            return
         if not os.path.exists(self._prefix_map_path):
             return
         try:
+            self._prefix_map_mtime = os.path.getmtime(self._prefix_map_path)
             with open(self._prefix_map_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
             if isinstance(data, dict):
@@ -294,6 +309,29 @@ class CacheFlowConnectorV1(KVConnectorBase_V1):
                 )
         except Exception as e:
             logger.warning(f"[CacheFlow] Failed to load prefix map: {e}")
+
+    def _refresh_prefix_map_if_needed(self) -> None:
+        if not self._load_prefix_map_enabled:
+            return
+        if not os.path.exists(self._prefix_map_path):
+            return
+        try:
+            mtime = os.path.getmtime(self._prefix_map_path)
+            if self._prefix_map_mtime is not None and mtime <= self._prefix_map_mtime:
+                return
+            self._prefix_map_mtime = mtime
+            with open(self._prefix_map_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                self._hash_to_dpu_block = {
+                    str(k): int(v) for k, v in data.items()
+                }
+                logger.info(
+                    f"[CacheFlow] Refreshed prefix map "
+                    f"({len(self._hash_to_dpu_block)} entries)"
+                )
+        except Exception as e:
+            logger.warning(f"[CacheFlow] Failed to refresh prefix map: {e}")
 
     def _persist_prefix_map(self) -> None:
         try:
@@ -318,6 +356,75 @@ class CacheFlowConnectorV1(KVConnectorBase_V1):
                 return idx
         return fallback_index
 
+    def _get_request_slot_mapping(
+        self,
+        attn_metadata: AttentionMetadata,
+        layer_name: str,
+        req_id: str,
+        request_row_indices: dict[str, int],
+    ) -> Optional[torch.Tensor]:
+        meta = attn_metadata
+        if isinstance(attn_metadata, dict):
+            meta = attn_metadata.get(layer_name, attn_metadata)
+        if meta is None:
+            return None
+        slot_mapping = getattr(meta, "slot_mapping", None)
+        if slot_mapping is None:
+            return None
+        query_start_loc = getattr(meta, "query_start_loc", None)
+        if query_start_loc is None:
+            query_start_loc = getattr(meta, "query_start_loc_cpu", None)
+        if query_start_loc is None:
+            return slot_mapping
+        row_index = request_row_indices.get(req_id, 0)
+        if row_index + 1 >= int(query_start_loc.shape[0]):
+            return slot_mapping
+        start = int(query_start_loc[row_index].item())
+        end = int(query_start_loc[row_index + 1].item())
+        return slot_mapping[start:end]
+
+    def _extract_kv_from_layer(
+        self,
+        kv_layer: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+    ) -> torch.Tensor:
+        if isinstance(attn_metadata, MLACommonMetadata):
+            num_pages, page_size = kv_layer.shape[0], kv_layer.shape[1]
+            return kv_layer.reshape(num_pages * page_size, -1)[slot_mapping, ...]
+        num_pages, page_size = kv_layer.shape[1], kv_layer.shape[2]
+        return kv_layer.reshape(2, num_pages * page_size, -1)[:, slot_mapping, ...]
+
+    def _allocate_kv_buffer(
+        self,
+        kv_layer: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+    ) -> torch.Tensor:
+        if isinstance(attn_metadata, MLACommonMetadata):
+            num_pages, page_size = kv_layer.shape[0], kv_layer.shape[1]
+            flat_dim = kv_layer.reshape(num_pages * page_size, -1).shape[-1]
+            shape = (int(slot_mapping.shape[0]), flat_dim)
+        else:
+            num_pages, page_size = kv_layer.shape[1], kv_layer.shape[2]
+            flat_dim = kv_layer.reshape(2, num_pages * page_size, -1).shape[-1]
+            shape = (2, int(slot_mapping.shape[0]), flat_dim)
+        return torch.empty(shape, device=kv_layer.device, dtype=kv_layer.dtype)
+
+    def _inject_kv_into_layer(
+        self,
+        kv_layer: torch.Tensor,
+        kv_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+    ) -> None:
+        if isinstance(attn_metadata, MLACommonMetadata):
+            num_pages, page_size = kv_layer.shape[0], kv_layer.shape[1]
+            kv_layer.reshape(num_pages * page_size, -1)[slot_mapping, ...] = kv_cache
+            return
+        num_pages, page_size = kv_layer.shape[1], kv_layer.shape[2]
+        kv_layer.reshape(2, num_pages * page_size, -1)[:, slot_mapping, ...] = kv_cache
+
     # ========================================================================
     # Scheduler-side methods
     # ========================================================================
@@ -340,8 +447,20 @@ class CacheFlowConnectorV1(KVConnectorBase_V1):
 
             req_id = getattr(request, 'request_id', str(id(request)))
 
-            # Compute prefix hash
-            prefix_hash = compute_prefix_hash(token_ids, len(token_ids))
+            # Compute prefix hash (use common prefix length if configured)
+            self._refresh_prefix_map_if_needed()
+            hash_len = self.common_prefix_num_tokens or len(token_ids)
+            cached_tokens = min(hash_len, len(token_ids))
+            if cached_tokens <= num_computed_tokens:
+                # Nothing new to load beyond local cache.
+                if req_id in self._request_trackers:
+                    tracker = self._request_trackers[req_id]
+                    tracker.is_loading = False
+                    tracker.dpu_block_id = None
+                    tracker.cached_tokens = cached_tokens
+                return 0, False
+
+            prefix_hash = compute_prefix_hash(token_ids, cached_tokens)
 
             # Create tracker for new requests
             if req_id not in self._request_trackers:
@@ -351,10 +470,12 @@ class CacheFlowConnectorV1(KVConnectorBase_V1):
                     token_ids=token_ids.copy(),
                     allocated_block_ids=[],
                     prefix_hash=prefix_hash,
+                    cached_tokens=cached_tokens,
                 )
                 logger.info(f"[CacheFlow] New request tracked: {req_id}, {len(token_ids)} tokens, hash={prefix_hash[:8]}...")
             else:
                 self._request_trackers[req_id].prefix_hash = prefix_hash
+                self._request_trackers[req_id].cached_tokens = cached_tokens
 
             tracker = self._request_trackers[req_id]
             dpu_block_id = self._hash_to_dpu_block.get(prefix_hash)
@@ -365,7 +486,14 @@ class CacheFlowConnectorV1(KVConnectorBase_V1):
                     f"[CacheFlow] Prefix hit for {req_id}: hash={prefix_hash[:8]}..., "
                     f"loading from DPU block {dpu_block_id}"
                 )
-                return 0, False
+                # Report matched tokens so vLLM's external hit rate reflects it.
+                matched_tokens = cached_tokens - num_computed_tokens
+                return matched_tokens, False
+
+            # Clear any stale load state if the prefix is no longer mapped.
+            if tracker.is_loading or tracker.dpu_block_id is not None:
+                tracker.is_loading = False
+                tracker.dpu_block_id = None
 
             return 0, False
 
@@ -420,6 +548,8 @@ class CacheFlowConnectorV1(KVConnectorBase_V1):
     ) -> CacheFlowConnectorMetadata:
         """Build metadata for this scheduling step."""
         with self._lock:
+            # Keep prefix map in sync so we don't emit stale load specs.
+            self._refresh_prefix_map_if_needed()
             load_specs: dict[str, LoadSpec] = {}
             save_specs: dict[str, SaveSpec] = {}
             request_row_indices: dict[str, int] = {}
@@ -455,9 +585,16 @@ class CacheFlowConnectorV1(KVConnectorBase_V1):
 
                     # Create load spec if we detected a prefix hit
                     if tracker.is_loading and tracker.dpu_block_id is not None:
+                        # Revalidate mapping to avoid stale prefix hits.
+                        current_block = self._hash_to_dpu_block.get(tracker.prefix_hash or "")
+                        if current_block != tracker.dpu_block_id:
+                            tracker.is_loading = False
+                            tracker.dpu_block_id = None
+                            continue
+                        cached_tokens = tracker.cached_tokens or len(tracker.token_ids)
                         load_specs[req_id] = LoadSpec(
                             vllm_cached_tokens=0,
-                            dpu_cached_tokens=len(tracker.token_ids),
+                            dpu_cached_tokens=cached_tokens,
                             can_load=True,
                             block_id=tracker.dpu_block_id,
                             prefix_hash=tracker.prefix_hash,
@@ -481,9 +618,16 @@ class CacheFlowConnectorV1(KVConnectorBase_V1):
                                 tracker.allocated_block_ids.extend(new_blocks[0])
 
                         if tracker.is_loading and tracker.dpu_block_id is not None and req_id not in load_specs:
+                            # Revalidate mapping to avoid stale prefix hits.
+                            current_block = self._hash_to_dpu_block.get(tracker.prefix_hash or "")
+                            if current_block != tracker.dpu_block_id:
+                                tracker.is_loading = False
+                                tracker.dpu_block_id = None
+                                continue
+                            cached_tokens = tracker.cached_tokens or len(tracker.token_ids)
                             load_specs[req_id] = LoadSpec(
                                 vllm_cached_tokens=0,
-                                dpu_cached_tokens=len(tracker.token_ids),
+                                dpu_cached_tokens=cached_tokens,
                                 can_load=True,
                                 block_id=tracker.dpu_block_id,
                                 prefix_hash=tracker.prefix_hash,
@@ -566,27 +710,58 @@ class CacheFlowConnectorV1(KVConnectorBase_V1):
 
             try:
                 self._stats["load_attempts"] += 1
-                row_index = metadata.request_row_indices.get(req_id, 0)
-                for layer_name, kv_layer in self._kv_caches.items():
-                    layer_attn = attn_metadata.get(layer_name) if isinstance(attn_metadata, dict) else None
-                    block_table = self._get_block_table(layer_attn) if layer_attn is not None else None
-                    if block_table is None or block_table.numel() == 0:
-                        continue
-
-                    row_index = self._resolve_row_index(
-                        block_table, load_spec.block_ids, row_index
+                if self._manager is not None and not self._manager.has_block(load_spec.block_id):
+                    logger.warning(
+                        f"[CacheFlow] DPU block {load_spec.block_id} not present in "
+                        f"current session; skipping load for {req_id}"
                     )
-                    if row_index >= block_table.shape[0]:
-                        logger.warning(
-                            f"[CacheFlow] Row index {row_index} out of range for "
-                            f"block_table shape {tuple(block_table.shape)} (req_id={req_id})"
-                        )
+                    if load_spec.prefix_hash:
+                        self._hash_to_dpu_block.pop(load_spec.prefix_hash, None)
+                        self._persist_prefix_map()
+                    continue
+                for layer_name, kv_layer in self._kv_caches.items():
+                    slot_mapping = self._get_request_slot_mapping(
+                        attn_metadata, layer_name, req_id, metadata.request_row_indices
+                    )
+                    if slot_mapping is None or slot_mapping.numel() == 0:
+                        slot_mapping = None
+                    cached_tokens = min(
+                        load_spec.dpu_cached_tokens,
+                        int(slot_mapping.numel()) if slot_mapping is not None else 0,
+                    )
+                    if cached_tokens <= 0:
+                        cached_tokens = load_spec.dpu_cached_tokens
+                    if cached_tokens <= 0:
                         continue
+                    if slot_mapping is None or int(slot_mapping.numel()) < cached_tokens:
+                        block_table = self._get_block_table(attn_metadata)
+                        row_index = self._resolve_row_index(
+                            block_table,
+                            load_spec.block_ids,
+                            metadata.request_row_indices.get(req_id, 0),
+                        )
+                        slot_mapping = self._build_prefix_slot_mapping(
+                            block_table,
+                            row_index,
+                            cached_tokens,
+                            kv_layer.device,
+                        )
+                        if slot_mapping is None or slot_mapping.numel() == 0:
+                            logger.info(
+                                f"[CacheFlow] No slot mapping for load {req_id}, skipping"
+                            )
+                            continue
+                    slot_mapping = slot_mapping[:cached_tokens]
+                    if slot_mapping.device != kv_layer.device:
+                        slot_mapping = slot_mapping.to(kv_layer.device)
 
-                    physical_block_id = int(block_table[row_index, 0].item())
-                    dst_tensor = kv_layer[physical_block_id]
-
-                    self._manager.fetch_tensor(load_spec.block_id, dst_tensor, sync=True)
+                    kv_cache = self._allocate_kv_buffer(
+                        kv_layer, slot_mapping, attn_metadata
+                    )
+                    self._manager.fetch_tensor(load_spec.block_id, kv_cache, sync=True)
+                    self._inject_kv_into_layer(
+                        kv_layer, kv_cache, slot_mapping, attn_metadata
+                    )
 
                 self._pending_loads[req_id] = True
                 self._stats["load_success"] += 1
@@ -633,72 +808,79 @@ class CacheFlowConnectorV1(KVConnectorBase_V1):
                 continue
 
             try:
-                # Get block table from attention metadata
-                block_table = self._get_block_table(attn_metadata)
-                if block_table is None:
-                    logger.info(f"[CacheFlow] No block_table in attn_metadata for {req_id}")
+                slot_mapping = self._get_request_slot_mapping(
+                    attn_metadata, layer_name, req_id, metadata.request_row_indices
+                )
+                cached_tokens = min(
+                    self.common_prefix_num_tokens or len(save_spec.token_ids),
+                    int(slot_mapping.numel()) if slot_mapping is not None else 0,
+                )
+                if cached_tokens <= 0:
+                    cached_tokens = self.common_prefix_num_tokens or len(save_spec.token_ids)
+                if cached_tokens <= 0:
                     continue
-
-                logger.info(f"[CacheFlow] block_table shape: {block_table.shape}")
-
-                # Extract KV data for this request
-                # block_table shape: [num_requests, max_blocks_per_request]
-                if block_table.shape[0] > 0 and block_table.shape[1] > 0:
-                    row_index = metadata.request_row_indices.get(req_id, 0)
+                if slot_mapping is None or int(slot_mapping.numel()) < cached_tokens:
+                    block_table = self._get_block_table(attn_metadata)
                     row_index = self._resolve_row_index(
-                        block_table, save_spec.block_ids, row_index
+                        block_table,
+                        save_spec.block_ids,
+                        metadata.request_row_indices.get(req_id, 0),
                     )
-                    if row_index >= block_table.shape[0]:
-                        logger.warning(
-                            f"[CacheFlow] Row index {row_index} out of range for "
-                            f"block_table shape {tuple(block_table.shape)} (req_id={req_id})"
-                        )
+                    slot_mapping = self._build_prefix_slot_mapping(
+                        block_table,
+                        row_index,
+                        cached_tokens,
+                        kv_layer.device,
+                    )
+                    if slot_mapping is None or slot_mapping.numel() == 0:
+                        logger.info(f"[CacheFlow] No slot_mapping for {req_id}, skipping")
                         continue
+                if cached_tokens <= 0:
+                    continue
+                slot_mapping = slot_mapping[:cached_tokens]
+                if slot_mapping.device != kv_layer.device:
+                    slot_mapping = slot_mapping.to(kv_layer.device)
 
-                    # Prefer scheduler-provided block IDs if available
-                    if save_spec.block_ids:
-                        physical_block_id = save_spec.block_ids[0]
-                    else:
-                        # Use per-request row mapping
-                        physical_block_id = block_table[row_index, 0].item()
-                    logger.info(f"[CacheFlow] physical_block_id: {physical_block_id}")
+                kv_block_data = self._extract_kv_from_layer(
+                    kv_layer, slot_mapping, attn_metadata
+                )
+                logger.info(
+                    f"[CacheFlow] kv_block_data shape: {kv_block_data.shape}, "
+                    f"dtype: {kv_block_data.dtype}"
+                )
 
-                    # Extract KV data
-                    kv_block_data = kv_layer[physical_block_id]
-                    logger.info(f"[CacheFlow] kv_block_data shape: {kv_block_data.shape}, dtype: {kv_block_data.dtype}")
+                # Compute hash for prefix caching
+                prefix_hash = compute_prefix_hash(
+                    save_spec.token_ids,
+                    cached_tokens,
+                )
 
-                    # Compute hash for prefix caching
-                    prefix_hash = compute_prefix_hash(
-                        save_spec.token_ids,
-                        len(save_spec.token_ids)
-                    )
+                # Assign DPU block ID deterministically from prefix hash
+                dpu_block_id = self._assign_dpu_block_id(prefix_hash)
 
-                    # Assign DPU block ID deterministically from prefix hash
-                    dpu_block_id = self._assign_dpu_block_id(prefix_hash)
+                logger.info(f"[CacheFlow] Offloading {layer_name} for {req_id} to DPU block {dpu_block_id}, size: {kv_block_data.numel() * kv_block_data.element_size()} bytes")
 
-                    logger.info(f"[CacheFlow] Offloading {layer_name} for {req_id} to DPU block {dpu_block_id}, size: {kv_block_data.numel() * kv_block_data.element_size()} bytes")
+                # Offload to DPU
+                self._stats["save_attempts"] += 1
+                self._manager.offload_tensor(
+                    block_id=dpu_block_id,
+                    tensor=kv_block_data.contiguous(),
+                    hash_key=prefix_hash,
+                    sync=True,
+                )
 
-                    # Offload to DPU
-                    self._stats["save_attempts"] += 1
-                    self._manager.offload_tensor(
-                        block_id=dpu_block_id,
-                        tensor=kv_block_data.contiguous(),
-                        hash_key=prefix_hash,
-                        sync=True,
-                    )
+                self._hash_to_dpu_block[prefix_hash] = dpu_block_id
+                self._persist_prefix_map()
+                self._stats["save_success"] += 1
 
-                    self._hash_to_dpu_block[prefix_hash] = dpu_block_id
-                    self._persist_prefix_map()
-                    self._stats["save_success"] += 1
+                # Track saved layer
+                if req_id not in self._pending_saves:
+                    self._pending_saves[req_id] = set()
+                self._pending_saves[req_id].add(layer_name)
 
-                    # Track saved layer
-                    if req_id not in self._pending_saves:
-                        self._pending_saves[req_id] = set()
-                    self._pending_saves[req_id].add(layer_name)
-
-                    logger.info(
-                        f"[CacheFlow] Successfully saved {layer_name} for {req_id} to DPU block {dpu_block_id}"
-                    )
+                logger.info(
+                    f"[CacheFlow] Successfully saved {layer_name} for {req_id} to DPU block {dpu_block_id}"
+                )
 
             except Exception as e:
                 self._stats["save_fail"] += 1
@@ -715,6 +897,42 @@ class CacheFlowConnectorV1(KVConnectorBase_V1):
             return attn_metadata.block_tables
         return None
 
+    def _build_prefix_slot_mapping(
+        self,
+        block_table: torch.Tensor,
+        row_index: int,
+        num_tokens: int,
+        device: torch.device,
+    ) -> Optional[torch.Tensor]:
+        """Build a slot mapping for the first num_tokens using the block table."""
+        if num_tokens <= 0:
+            return None
+        if block_table is None:
+            return None
+        if row_index < 0 or row_index >= int(block_table.shape[0]):
+            return None
+
+        # block_table contains block IDs per sequence; use kv_block_size to expand to slots.
+        row = block_table[row_index]
+        if row is None:
+            return None
+        block_ids = row.tolist()
+        slot_indices: list[int] = []
+        tokens_remaining = num_tokens
+        for block_id in block_ids:
+            if tokens_remaining <= 0:
+                break
+            if block_id is None or int(block_id) < 0:
+                break
+            base = int(block_id) * int(self.kv_block_size)
+            take = min(tokens_remaining, int(self.kv_block_size))
+            slot_indices.extend(range(base, base + take))
+            tokens_remaining -= take
+
+        if not slot_indices:
+            return None
+        return torch.tensor(slot_indices, device=device, dtype=torch.int32)
+
     def wait_for_save(self):
         """Wait for all save operations to complete."""
         # Currently synchronous
@@ -725,6 +943,10 @@ class CacheFlowConnectorV1(KVConnectorBase_V1):
         finished_req_ids: set[str],
     ) -> tuple[set[str] | None, set[str] | None]:
         """Return IDs of requests that finished transfers."""
+        extra_config = getattr(self._kv_transfer_config, "kv_connector_extra_config", None)
+        if not isinstance(extra_config, dict):
+            extra_config = {}
+        report_finished = extra_config.get("report_finished_ids", False)
         finished_saves = set()
         finished_loads = set()
 
@@ -740,6 +962,9 @@ class CacheFlowConnectorV1(KVConnectorBase_V1):
             # Clean up scheduler-side tracker
             with self._lock:
                 self._request_trackers.pop(req_id, None)
+
+        if not report_finished:
+            return (None, None)
 
         return (
             finished_saves if finished_saves else None,

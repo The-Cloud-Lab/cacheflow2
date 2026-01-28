@@ -45,6 +45,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 from vllm.distributed.kv_transfer.kv_connector.v1.lmcache_integration.utils import (
     ENGINE_NAME,
     apply_mm_hashes_to_token_ids,
+    create_lmcache_metadata,
     extract_mm_features,
     lmcache_get_or_create_config,
     mla_enabled,
@@ -600,15 +601,21 @@ class LMCacheConnectorV1Impl:
                         )
 
         self.config = config
+        metadata, _ = create_lmcache_metadata(vllm_config=vllm_config)
 
         self.async_loading = config.enable_async_loading
         self.layerwise_retrievers: list[Generator[torch.Tensor | None, None, None]] = []
         self._stats_monitor = LMCStatsMonitor.GetOrCreate()
         if role == KVConnectorRole.SCHEDULER:
             # Create lookup client using factory
-            self.lookup_client = LookupClientFactory.create_lookup_client(
-                vllm_config, config
-            )
+            try:
+                self.lookup_client = LookupClientFactory.create_lookup_client(
+                    vllm_config, config, metadata
+                )
+            except TypeError:
+                self.lookup_client = LookupClientFactory.create_lookup_client(
+                    vllm_config, config
+                )
             self._unfinished_requests: dict[str, Request] = {}
             self._lookup_requests_in_step: list[str] = []
             self.lmcache_engine = None
@@ -631,9 +638,14 @@ class LMCacheConnectorV1Impl:
 
             # Create lookup server using factory
             assert self.lmcache_engine is not None
-            self.lookup_server = LookupClientFactory.create_lookup_server(
-                self.lmcache_engine, vllm_config
-            )
+            try:
+                self.lookup_server = LookupClientFactory.create_lookup_server(
+                    self.lmcache_engine, vllm_config, metadata
+                )
+            except TypeError:
+                self.lookup_server = LookupClientFactory.create_lookup_server(
+                    self.lmcache_engine, vllm_config
+                )
 
             self.offload_server = ZMQOffloadServer(
                 self.lmcache_engine,
@@ -1038,9 +1050,11 @@ class LMCacheConnectorV1Impl:
         connector_metadata = self._parent._get_connector_metadata()
         assert isinstance(connector_metadata, LMCacheConnectorMetadata)
 
-        self.lmcache_engine.lookup_unpin(  # type: ignore
-            connector_metadata.lookup_requests_in_step
-        )
+        lookup_ids = connector_metadata.lookup_requests_in_step
+        if lookup_ids:
+            # lmcache.lookup_unpin expects a single lookup_id in some versions.
+            for lookup_id in lookup_ids:
+                self.lmcache_engine.lookup_unpin(lookup_id)  # type: ignore
 
         if self.kv_role == "kv_consumer":
             # Don't do save if the role is kv_consumer

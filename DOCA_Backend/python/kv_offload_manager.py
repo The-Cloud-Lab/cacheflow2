@@ -397,6 +397,12 @@ class KVOffloadManager:
         with self._lock:
             return self._hash_to_block.get(hash_key)
 
+    def has_block(self, block_id: int) -> bool:
+        """Check if a block exists and is on DPU."""
+        with self._lock:
+            block = self._blocks.get(block_id)
+            return block is not None and block.state == BlockState.ON_DPU
+
     def has_prefix(self, hash_key: str) -> bool:
         """Check if a prefix is cached on the DPU."""
         block_id = self.find_by_hash(hash_key)

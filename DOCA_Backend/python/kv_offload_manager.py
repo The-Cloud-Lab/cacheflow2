@@ -71,6 +71,9 @@ class BlockInfo:
     refcount: int = 0  # Number of sequences using this block
     last_access: float = 0.0
     hash_key: Optional[str] = None  # For prefix matching
+    pending_transfer_id: Optional[int] = None
+    pending_transfer_start: Optional[float] = None
+    pending_transfer_size: int = 0
 
 
 class KVOffloadManager:
@@ -136,6 +139,10 @@ class KVOffloadManager:
 
         # LRU tracking for eviction
         self._lru_order: List[int] = []
+        self._async_wait_ms_total = 0.0
+        self._async_wait_ms_max = 0.0
+        self._async_wait_count = 0
+        self._async_bytes_total = 0
 
         logger.info(
             f"KVOffloadManager initialized: block_size={block_size}, "
@@ -264,7 +271,9 @@ class KVOffloadManager:
                 # DPU->Host load writes into this same buffer.
             else:
                 # Store transfer_id for later completion check
-                block._pending_transfer_id = transfer_id
+                block.pending_transfer_id = transfer_id
+                block.pending_transfer_start = time.perf_counter()
+                block.pending_transfer_size = size
 
             # Update hash index for prefix matching
             if hash_key:
@@ -301,6 +310,34 @@ class KVOffloadManager:
 
         size = tensor.numel() * tensor.element_size()
         self.offload_block(block_id, tensor.data_ptr(), size, hash_key, sync)
+
+    def wait_for_pending_transfers(self, block_ids: Optional[List[int]] = None) -> None:
+        """Wait for any pending offload transfers to complete."""
+        with self._lock:
+            targets = block_ids if block_ids is not None else list(self._blocks.keys())
+            for block_id in targets:
+                block = self._blocks.get(block_id)
+                if block is None:
+                    continue
+                if block.pending_transfer_id is None:
+                    continue
+                try:
+                    start = block.pending_transfer_start
+                    self._doca_client.wait_transfer(block.pending_transfer_id)
+                    if start is not None:
+                        elapsed_ms = (time.perf_counter() - start) * 1000.0
+                        self._async_wait_ms_total += elapsed_ms
+                        self._async_wait_ms_max = max(
+                            self._async_wait_ms_max, elapsed_ms
+                        )
+                        self._async_wait_count += 1
+                        self._async_bytes_total += block.pending_transfer_size
+                    block.pending_transfer_id = None
+                    block.pending_transfer_start = None
+                    block.pending_transfer_size = 0
+                    block.state = BlockState.ON_DPU
+                except Exception as e:
+                    logger.warning(f"Failed waiting for transfer of block {block_id}: {e}")
 
     def fetch_block(
         self,
@@ -440,6 +477,10 @@ class KVOffloadManager:
             "blocks_on_dpu": blocks_on_dpu,
             "blocks_on_gpu": blocks_on_gpu,
             "total_blocks": len(self._blocks),
+            "async_wait_ms_total": self._async_wait_ms_total,
+            "async_wait_ms_max": self._async_wait_ms_max,
+            "async_wait_count": self._async_wait_count,
+            "async_bytes_total": self._async_bytes_total,
         }
 
     def close(self) -> None:

@@ -69,6 +69,9 @@ class KVTransferConfig:
     'recompute': reschedule the request to recompute failed blocks (default)
     'fail': immediately fail the request with an error finish reason"""
 
+    common_prefix_num_tokens: int = 0
+    """Number of prefix tokens expected to be common across requests for KV reuse."""
+
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,

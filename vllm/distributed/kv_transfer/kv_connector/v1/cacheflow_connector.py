@@ -21,6 +21,8 @@ Usage:
 """
 
 import hashlib
+import math
+from collections import OrderedDict
 import logging
 import sys
 import threading
@@ -215,9 +217,21 @@ class CacheFlowConnectorV1(KVConnectorBase_V1):
         self.num_staging_buffers = extra_config.get('num_staging_buffers', 4)
         self.async_transfers = extra_config.get('async_transfers', True)
         self.tokens_per_block = extra_config.get('tokens_per_block', 1024)
-        self.common_prefix_num_tokens = extra_config.get(
-            'common_prefix_num_tokens', 0
+        self._skip_save_if_prefix_cached = bool(
+            extra_config.get("skip_save_if_prefix_cached", True)
         )
+        self._offload_full_prompt = bool(
+            extra_config.get("offload_full_prompt", False)
+        )
+        self._min_cached_tokens = int(
+            extra_config.get("min_cached_tokens", 0)
+        )
+        common_prefix_num_tokens = extra_config.get("common_prefix_num_tokens")
+        if common_prefix_num_tokens is None:
+            common_prefix_num_tokens = getattr(
+                self._kv_transfer_config, "common_prefix_num_tokens", 0
+            )
+        self.common_prefix_num_tokens = int(common_prefix_num_tokens or 0)
         self._load_prefix_map_enabled = bool(
             extra_config.get("load_prefix_map", False)
         )
@@ -260,12 +274,21 @@ class CacheFlowConnectorV1(KVConnectorBase_V1):
         self._load_errors: set[int] = set()
         self._pending_loads: dict[str, bool] = {}
         self._pending_saves: dict[str, set[str]] = {}  # req_id -> set of layer names
+        self._pending_offloads: dict[str, set[int]] = {}
+        self._save_batches: dict[str, dict[str, torch.Tensor]] = {}
+        self._save_batch_cached_tokens: dict[str, int] = {}
         self._kv_caches: dict[str, torch.Tensor] = {}
         self._hash_to_dpu_block: dict[str, int] = {}
+        self._block_id_to_hash: dict[int, str] = {}
+        self._prefix_lru: OrderedDict[str, None] = OrderedDict()
         self._stats = {
             "save_attempts": 0,
             "save_success": 0,
             "save_fail": 0,
+            "save_bytes_total": 0,
+            "save_bytes_max": 0,
+            "save_cached_tokens_total": 0,
+            "save_cached_tokens_max": 0,
             "load_attempts": 0,
             "load_success": 0,
             "load_fail": 0,
@@ -283,6 +306,52 @@ class CacheFlowConnectorV1(KVConnectorBase_V1):
     def _assign_dpu_block_id(self, prefix_hash: str) -> int:
         """Deterministically map a prefix hash to a DPU block ID."""
         return int(prefix_hash[:8], 16) % self.max_blocks
+
+    def _record_prefix_use(self, prefix_hash: str) -> None:
+        self._prefix_lru.pop(prefix_hash, None)
+        self._prefix_lru[prefix_hash] = None
+
+    def _evict_prefix(self, prefix_hash: str) -> None:
+        block_id = self._hash_to_dpu_block.pop(prefix_hash, None)
+        if block_id is not None:
+            self._block_id_to_hash.pop(block_id, None)
+        self._prefix_lru.pop(prefix_hash, None)
+
+    def _assign_block_for_prefix(self, prefix_hash: str) -> tuple[int, list[str]]:
+        """Assign a block for a prefix hash, avoiding collisions."""
+        with self._lock:
+            existing = self._hash_to_dpu_block.get(prefix_hash)
+            if existing is not None:
+                self._record_prefix_use(prefix_hash)
+                return existing, []
+
+            base = self._assign_dpu_block_id(prefix_hash)
+            for offset in range(self.max_blocks):
+                candidate = (base + offset) % self.max_blocks
+                if candidate not in self._block_id_to_hash:
+                    self._block_id_to_hash[candidate] = prefix_hash
+                    self._hash_to_dpu_block[prefix_hash] = candidate
+                    self._record_prefix_use(prefix_hash)
+                    return candidate, []
+
+            # No free blocks, evict the LRU prefix.
+            evicted_hashes: list[str] = []
+            if self._prefix_lru:
+                evicted_hash = next(iter(self._prefix_lru))
+                evicted_block = self._hash_to_dpu_block.get(evicted_hash)
+                self._evict_prefix(evicted_hash)
+                evicted_hashes.append(evicted_hash)
+                if evicted_block is not None:
+                    self._block_id_to_hash[evicted_block] = prefix_hash
+                    self._hash_to_dpu_block[prefix_hash] = evicted_block
+                    self._record_prefix_use(prefix_hash)
+                    return evicted_block, evicted_hashes
+
+            # Fallback: reuse deterministic mapping.
+            self._block_id_to_hash[base] = prefix_hash
+            self._hash_to_dpu_block[prefix_hash] = base
+            self._record_prefix_use(prefix_hash)
+            return base, evicted_hashes
 
     def _get_prefix_map_path(self, extra_config: dict[str, Any]) -> str:
         path = extra_config.get("prefix_map_path")
@@ -303,6 +372,12 @@ class CacheFlowConnectorV1(KVConnectorBase_V1):
                 self._hash_to_dpu_block = {
                     str(k): int(v) for k, v in data.items()
                 }
+                self._block_id_to_hash = {
+                    int(v): str(k) for k, v in self._hash_to_dpu_block.items()
+                }
+                self._prefix_lru = OrderedDict(
+                    (str(k), None) for k in self._hash_to_dpu_block.keys()
+                )
                 logger.info(
                     f"[CacheFlow] Loaded {len(self._hash_to_dpu_block)} prefix mappings "
                     f"from {self._prefix_map_path}"
@@ -326,6 +401,12 @@ class CacheFlowConnectorV1(KVConnectorBase_V1):
                 self._hash_to_dpu_block = {
                     str(k): int(v) for k, v in data.items()
                 }
+                self._block_id_to_hash = {
+                    int(v): str(k) for k, v in self._hash_to_dpu_block.items()
+                }
+                self._prefix_lru = OrderedDict(
+                    (str(k), None) for k in self._hash_to_dpu_block.keys()
+                )
                 logger.info(
                     f"[CacheFlow] Refreshed prefix map "
                     f"({len(self._hash_to_dpu_block)} entries)"
@@ -411,6 +492,25 @@ class CacheFlowConnectorV1(KVConnectorBase_V1):
             shape = (2, int(slot_mapping.shape[0]), flat_dim)
         return torch.empty(shape, device=kv_layer.device, dtype=kv_layer.dtype)
 
+    def _get_kv_cache_shape(
+        self,
+        kv_layer: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+    ) -> tuple[int, ...]:
+        if isinstance(attn_metadata, MLACommonMetadata):
+            num_pages, page_size = kv_layer.shape[0], kv_layer.shape[1]
+            flat_dim = kv_layer.reshape(num_pages * page_size, -1).shape[-1]
+            return (int(slot_mapping.shape[0]), flat_dim)
+        num_pages, page_size = kv_layer.shape[1], kv_layer.shape[2]
+        flat_dim = kv_layer.reshape(2, num_pages * page_size, -1).shape[-1]
+        return (2, int(slot_mapping.shape[0]), flat_dim)
+
+    def _get_layer_order(self) -> list[str]:
+        if not self._kv_caches:
+            return []
+        return sorted(self._kv_caches.keys())
+
     def _inject_kv_into_layer(
         self,
         kv_layer: torch.Tensor,
@@ -449,7 +549,11 @@ class CacheFlowConnectorV1(KVConnectorBase_V1):
 
             # Compute prefix hash (use common prefix length if configured)
             self._refresh_prefix_map_if_needed()
-            hash_len = self.common_prefix_num_tokens or len(token_ids)
+            hash_len = (
+                len(token_ids)
+                if self._offload_full_prompt
+                else (self.common_prefix_num_tokens or len(token_ids))
+            )
             cached_tokens = min(hash_len, len(token_ids))
             if cached_tokens <= num_computed_tokens:
                 # Nothing new to load beyond local cache.
@@ -480,6 +584,7 @@ class CacheFlowConnectorV1(KVConnectorBase_V1):
             tracker = self._request_trackers[req_id]
             dpu_block_id = self._hash_to_dpu_block.get(prefix_hash)
             if dpu_block_id is not None:
+                self._record_prefix_use(prefix_hash)
                 tracker.is_loading = True
                 tracker.dpu_block_id = dpu_block_id
                 logger.info(
@@ -703,6 +808,7 @@ class CacheFlowConnectorV1(KVConnectorBase_V1):
         if isinstance(attn_metadata, list):
             attn_metadata = attn_metadata[0] if attn_metadata else {}
 
+        layer_order = self._get_layer_order()
         for req_id, load_spec in metadata.load_specs.items():
             if not load_spec.can_load or load_spec.block_id is None:
                 logger.info(f"[CacheFlow] Load spec for {req_id} not loadable, skipping")
@@ -711,15 +817,20 @@ class CacheFlowConnectorV1(KVConnectorBase_V1):
             try:
                 self._stats["load_attempts"] += 1
                 if self._manager is not None and not self._manager.has_block(load_spec.block_id):
+                    self._manager.wait_for_pending_transfers([load_spec.block_id])
+                if self._manager is not None and not self._manager.has_block(load_spec.block_id):
                     logger.warning(
                         f"[CacheFlow] DPU block {load_spec.block_id} not present in "
                         f"current session; skipping load for {req_id}"
                     )
                     if load_spec.prefix_hash:
-                        self._hash_to_dpu_block.pop(load_spec.prefix_hash, None)
+                        self._evict_prefix(load_spec.prefix_hash)
                         self._persist_prefix_map()
                     continue
-                for layer_name, kv_layer in self._kv_caches.items():
+                kv_layer_slices: list[tuple[str, torch.Tensor, torch.Tensor, tuple[int, ...]]] = []
+                total_elems = 0
+                for layer_name in layer_order:
+                    kv_layer = self._kv_caches[layer_name]
                     slot_mapping = self._get_request_slot_mapping(
                         attn_metadata, layer_name, req_id, metadata.request_row_indices
                     )
@@ -755,10 +866,29 @@ class CacheFlowConnectorV1(KVConnectorBase_V1):
                     if slot_mapping.device != kv_layer.device:
                         slot_mapping = slot_mapping.to(kv_layer.device)
 
-                    kv_cache = self._allocate_kv_buffer(
+                    kv_shape = self._get_kv_cache_shape(
                         kv_layer, slot_mapping, attn_metadata
                     )
-                    self._manager.fetch_tensor(load_spec.block_id, kv_cache, sync=True)
+                    numel = int(math.prod(kv_shape))
+                    kv_layer_slices.append((layer_name, kv_layer, slot_mapping, kv_shape))
+                    total_elems += numel
+
+                if total_elems <= 0:
+                    continue
+
+                first_layer = next(iter(self._kv_caches.values()))
+                combined = torch.empty(
+                    (total_elems,),
+                    device=first_layer.device,
+                    dtype=first_layer.dtype,
+                )
+                self._manager.fetch_tensor(load_spec.block_id, combined, sync=True)
+
+                offset = 0
+                for layer_name, kv_layer, slot_mapping, kv_shape in kv_layer_slices:
+                    numel = int(math.prod(kv_shape))
+                    kv_cache = combined[offset:offset + numel].view(kv_shape)
+                    offset += numel
                     self._inject_kv_into_layer(
                         kv_layer, kv_cache, slot_mapping, attn_metadata
                     )
@@ -795,6 +925,10 @@ class CacheFlowConnectorV1(KVConnectorBase_V1):
             logger.info(f"[CacheFlow] No save_specs in metadata, skipping save")
             return
 
+        if not self._kv_caches:
+            logger.info("[CacheFlow] No KV caches registered, skipping save")
+            return
+
         if self._manager is None:
             logger.warning("[CacheFlow] DOCA manager not initialized, cannot save KV")
             return
@@ -808,16 +942,42 @@ class CacheFlowConnectorV1(KVConnectorBase_V1):
                 continue
 
             try:
+                expected_cached_tokens = (
+                    len(save_spec.token_ids)
+                    if self._offload_full_prompt
+                    else (self.common_prefix_num_tokens or len(save_spec.token_ids))
+                )
+                if expected_cached_tokens > 0:
+                    prefix_hash = compute_prefix_hash(
+                        save_spec.token_ids,
+                        expected_cached_tokens,
+                    )
+                    if self._skip_save_if_prefix_cached:
+                        cached_block = self._hash_to_dpu_block.get(prefix_hash)
+                        if cached_block is not None and self._manager.has_block(cached_block):
+                            logger.info(
+                                f"[CacheFlow] Prefix already cached for {req_id}, "
+                                f"skipping save to DPU block {cached_block}"
+                            )
+                            continue
+
                 slot_mapping = self._get_request_slot_mapping(
                     attn_metadata, layer_name, req_id, metadata.request_row_indices
                 )
+                desired_tokens = (
+                    len(save_spec.token_ids)
+                    if self._offload_full_prompt
+                    else (self.common_prefix_num_tokens or len(save_spec.token_ids))
+                )
                 cached_tokens = min(
-                    self.common_prefix_num_tokens or len(save_spec.token_ids),
+                    desired_tokens,
                     int(slot_mapping.numel()) if slot_mapping is not None else 0,
                 )
                 if cached_tokens <= 0:
-                    cached_tokens = self.common_prefix_num_tokens or len(save_spec.token_ids)
-                if cached_tokens <= 0:
+                    cached_tokens = desired_tokens
+                if cached_tokens <= 0 or (
+                    self._min_cached_tokens and cached_tokens < self._min_cached_tokens
+                ):
                     continue
                 if slot_mapping is None or int(slot_mapping.numel()) < cached_tokens:
                     block_table = self._get_block_table(attn_metadata)
@@ -844,43 +1004,84 @@ class CacheFlowConnectorV1(KVConnectorBase_V1):
                 kv_block_data = self._extract_kv_from_layer(
                     kv_layer, slot_mapping, attn_metadata
                 )
-                logger.info(
-                    f"[CacheFlow] kv_block_data shape: {kv_block_data.shape}, "
-                    f"dtype: {kv_block_data.dtype}"
-                )
+                if req_id not in self._save_batches:
+                    self._save_batches[req_id] = {}
+                self._save_batches[req_id][layer_name] = kv_block_data.contiguous()
+
+                if req_id not in self._save_batch_cached_tokens:
+                    self._save_batch_cached_tokens[req_id] = cached_tokens
+                else:
+                    self._save_batch_cached_tokens[req_id] = min(
+                        self._save_batch_cached_tokens[req_id],
+                        cached_tokens,
+                    )
+
+                layer_order = self._get_layer_order()
+                if len(self._save_batches[req_id]) < len(layer_order):
+                    continue
+
+                cached_tokens_final = self._save_batch_cached_tokens[req_id]
 
                 # Compute hash for prefix caching
                 prefix_hash = compute_prefix_hash(
                     save_spec.token_ids,
-                    cached_tokens,
+                    cached_tokens_final,
                 )
 
-                # Assign DPU block ID deterministically from prefix hash
-                dpu_block_id = self._assign_dpu_block_id(prefix_hash)
+                # Assign DPU block ID with collision avoidance
+                dpu_block_id, evicted_hashes = self._assign_block_for_prefix(
+                    prefix_hash
+                )
 
-                logger.info(f"[CacheFlow] Offloading {layer_name} for {req_id} to DPU block {dpu_block_id}, size: {kv_block_data.numel() * kv_block_data.element_size()} bytes")
+                # Concatenate all layers into one buffer for transfer
+                ordered_blocks = [
+                    (
+                        self._save_batches[req_id][name][:cached_tokens_final, ...]
+                        if self._save_batches[req_id][name].dim() == 2
+                        else self._save_batches[req_id][name][:, :cached_tokens_final, ...]
+                    ).reshape(-1)
+                    for name in layer_order
+                ]
+                combined = torch.cat(ordered_blocks, dim=0)
+                bytes_size = combined.numel() * combined.element_size()
+                self._stats["save_bytes_total"] += bytes_size
+                self._stats["save_bytes_max"] = max(
+                    self._stats["save_bytes_max"],
+                    bytes_size,
+                )
+                self._stats["save_cached_tokens_total"] += cached_tokens_final
+                self._stats["save_cached_tokens_max"] = max(
+                    self._stats["save_cached_tokens_max"],
+                    cached_tokens_final,
+                )
 
-                # Offload to DPU
+                logger.info(
+                    f"[CacheFlow] Offloading batched KV for {req_id} to DPU block "
+                    f"{dpu_block_id}, size: {bytes_size} bytes"
+                )
+
+                # Offload to DPU asynchronously
                 self._stats["save_attempts"] += 1
                 self._manager.offload_tensor(
                     block_id=dpu_block_id,
-                    tensor=kv_block_data.contiguous(),
+                    tensor=combined,
                     hash_key=prefix_hash,
-                    sync=True,
+                    sync=False,
                 )
 
-                self._hash_to_dpu_block[prefix_hash] = dpu_block_id
                 self._persist_prefix_map()
                 self._stats["save_success"] += 1
 
-                # Track saved layer
+                if req_id not in self._pending_offloads:
+                    self._pending_offloads[req_id] = set()
+                self._pending_offloads[req_id].add(dpu_block_id)
+
                 if req_id not in self._pending_saves:
                     self._pending_saves[req_id] = set()
-                self._pending_saves[req_id].add(layer_name)
+                self._pending_saves[req_id].update(layer_order)
 
-                logger.info(
-                    f"[CacheFlow] Successfully saved {layer_name} for {req_id} to DPU block {dpu_block_id}"
-                )
+                del self._save_batches[req_id]
+                del self._save_batch_cached_tokens[req_id]
 
             except Exception as e:
                 self._stats["save_fail"] += 1
@@ -935,8 +1136,15 @@ class CacheFlowConnectorV1(KVConnectorBase_V1):
 
     def wait_for_save(self):
         """Wait for all save operations to complete."""
-        # Currently synchronous
-        pass
+        if self._manager is None:
+            return
+        pending_block_ids: set[int] = set()
+        for block_ids in self._pending_offloads.values():
+            pending_block_ids.update(block_ids)
+        if not pending_block_ids:
+            return
+        self._manager.wait_for_pending_transfers(list(pending_block_ids))
+        self._pending_offloads.clear()
 
     def get_finished(
         self,
@@ -958,6 +1166,9 @@ class CacheFlowConnectorV1(KVConnectorBase_V1):
             if req_id in self._pending_loads:
                 finished_loads.add(req_id)
                 del self._pending_loads[req_id]
+
+            if req_id in self._pending_offloads:
+                del self._pending_offloads[req_id]
 
             # Clean up scheduler-side tracker
             with self._lock:
@@ -987,10 +1198,50 @@ class CacheFlowConnectorV1(KVConnectorBase_V1):
             self._stats["load_attempts"],
             self._stats["load_fail"],
         )
+        if self._stats["save_attempts"]:
+            avg_bytes = self._stats["save_bytes_total"] / self._stats["save_attempts"]
+            logger.info(
+                "[CacheFlow] Save bytes: total=%d, avg=%.1f, max=%d",
+                self._stats["save_bytes_total"],
+                avg_bytes,
+                self._stats["save_bytes_max"],
+            )
+            avg_tokens = (
+                self._stats["save_cached_tokens_total"] / self._stats["save_attempts"]
+            )
+            logger.info(
+                "[CacheFlow] Cached tokens: total=%d, avg=%.1f, max=%d",
+                self._stats["save_cached_tokens_total"],
+                avg_tokens,
+                self._stats["save_cached_tokens_max"],
+            )
+        if self._manager is not None:
+            try:
+                mgr_stats = self._manager.get_stats()
+                async_wait_ms_total = mgr_stats.get("async_wait_ms_total", 0.0)
+                async_wait_ms_max = mgr_stats.get("async_wait_ms_max", 0.0)
+                async_wait_count = mgr_stats.get("async_wait_count", 0)
+                async_bytes_total = mgr_stats.get("async_bytes_total", 0)
+                logger.info(
+                    "[CacheFlow] Async waits: count=%d, total_ms=%.3f, max_ms=%.3f, bytes=%d",
+                    async_wait_count,
+                    async_wait_ms_total,
+                    async_wait_ms_max,
+                    async_bytes_total,
+                )
+            except Exception as e:
+                logger.debug(f"[CacheFlow] Failed to fetch manager stats: {e}")
+        self.wait_for_save()
         DOCABackendLoader.close()
         self._request_trackers.clear()
         self._pending_loads.clear()
         self._pending_saves.clear()
+        self._pending_offloads.clear()
+        self._save_batches.clear()
+        self._save_batch_cached_tokens.clear()
+        self._hash_to_dpu_block.clear()
+        self._block_id_to_hash.clear()
+        self._prefix_lru.clear()
 
     def reset_cache(self) -> bool:
         """Reset the cache state."""
@@ -999,6 +1250,12 @@ class CacheFlowConnectorV1(KVConnectorBase_V1):
             self._pending_loads.clear()
             self._pending_saves.clear()
             self._load_errors.clear()
+            self._pending_offloads.clear()
+            self._save_batches.clear()
+            self._save_batch_cached_tokens.clear()
+            self._hash_to_dpu_block.clear()
+            self._block_id_to_hash.clear()
+            self._prefix_lru.clear()
         return True
 
     @classmethod

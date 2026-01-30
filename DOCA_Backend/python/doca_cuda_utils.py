@@ -13,7 +13,7 @@ pinned buffer on the host for the DMA transfer.
 
 import ctypes
 from ctypes import c_void_p, c_size_t, c_int, POINTER
-from typing import Optional, Dict, Tuple, List
+from typing import Optional, Dict, Tuple, List, TYPE_CHECKING
 import threading
 
 
@@ -113,6 +113,30 @@ class CUDARuntime:
         # cudaDeviceSynchronize
         lib.cudaDeviceSynchronize.argtypes = []
         lib.cudaDeviceSynchronize.restype = c_int
+
+        # cudaEventCreateWithFlags
+        lib.cudaEventCreateWithFlags.argtypes = [POINTER(c_void_p), c_int]
+        lib.cudaEventCreateWithFlags.restype = c_int
+
+        # cudaEventRecord
+        lib.cudaEventRecord.argtypes = [c_void_p, c_void_p]
+        lib.cudaEventRecord.restype = c_int
+
+        # cudaEventQuery
+        lib.cudaEventQuery.argtypes = [c_void_p]
+        lib.cudaEventQuery.restype = c_int
+
+        # cudaEventSynchronize
+        lib.cudaEventSynchronize.argtypes = [c_void_p]
+        lib.cudaEventSynchronize.restype = c_int
+
+        # cudaEventDestroy
+        lib.cudaEventDestroy.argtypes = [c_void_p]
+        lib.cudaEventDestroy.restype = c_int
+
+        # cudaStreamWaitEvent
+        lib.cudaStreamWaitEvent.argtypes = [c_void_p, c_void_p, c_int]
+        lib.cudaStreamWaitEvent.restype = c_int
 
     @classmethod
     def check_error(cls, result: int, msg: str = ""):
@@ -231,6 +255,61 @@ class CUDARuntime:
         lib = cls._load_library()
         result = lib.cudaStreamDestroy(c_void_p(stream))
         cls.check_error(result, "cudaStreamDestroy")
+
+    @classmethod
+    def event_create(cls, disable_timing: bool = True, interprocess: bool = False) -> int:
+        """Create a CUDA event."""
+        lib = cls._load_library()
+        event = c_void_p()
+        flags = 0
+        if disable_timing:
+            flags |= 0x02  # cudaEventDisableTiming
+        if interprocess:
+            flags |= 0x01  # cudaEventInterprocess
+        result = lib.cudaEventCreateWithFlags(ctypes.byref(event), c_int(flags))
+        cls.check_error(result, "cudaEventCreate")
+        return event.value
+
+    @classmethod
+    def event_record(cls, event: int, stream: Optional[int] = None) -> None:
+        """Record an event on a stream."""
+        lib = cls._load_library()
+        stream_ptr = c_void_p(stream) if stream else c_void_p(0)
+        result = lib.cudaEventRecord(c_void_p(event), stream_ptr)
+        cls.check_error(result, "cudaEventRecord")
+
+    @classmethod
+    def event_query(cls, event: int) -> bool:
+        """Non-blocking check if event completed. Returns True if complete."""
+        lib = cls._load_library()
+        result = lib.cudaEventQuery(c_void_p(event))
+        if result == 0:  # cudaSuccess
+            return True
+        elif result == 600:  # cudaErrorNotReady
+            return False
+        cls.check_error(result, "cudaEventQuery")
+        return False
+
+    @classmethod
+    def event_synchronize(cls, event: int) -> None:
+        """Wait for an event to complete."""
+        lib = cls._load_library()
+        result = lib.cudaEventSynchronize(c_void_p(event))
+        cls.check_error(result, "cudaEventSynchronize")
+
+    @classmethod
+    def event_destroy(cls, event: int) -> None:
+        """Destroy a CUDA event."""
+        lib = cls._load_library()
+        result = lib.cudaEventDestroy(c_void_p(event))
+        cls.check_error(result, "cudaEventDestroy")
+
+    @classmethod
+    def stream_wait_event(cls, stream: int, event: int) -> None:
+        """Make a stream wait for an event."""
+        lib = cls._load_library()
+        result = lib.cudaStreamWaitEvent(c_void_p(stream), c_void_p(event), c_int(0))
+        cls.check_error(result, "cudaStreamWaitEvent")
 
 
 class PinnedBuffer:
@@ -383,6 +462,133 @@ class PinnedBufferPool:
                 buf.free()
             self._available.clear()
             self._in_use.clear()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+        return False
+
+
+class CUDAEvent:
+    """
+    CUDA event wrapper for async synchronization.
+
+    Events are used to track completion of operations on CUDA streams
+    without blocking the CPU thread.
+    """
+
+    def __init__(self, disable_timing: bool = True, interprocess: bool = False):
+        """
+        Create a CUDA event.
+
+        Args:
+            disable_timing: Disable timing for better performance
+            interprocess: Allow event sharing between processes
+        """
+        self._event = CUDARuntime.event_create(disable_timing, interprocess)
+        self._destroyed = False
+
+    @property
+    def handle(self) -> int:
+        """Get the raw event handle."""
+        return self._event
+
+    def record(self, stream: Optional[int] = None) -> None:
+        """Record the event on a stream."""
+        if self._destroyed:
+            raise RuntimeError("Event has been destroyed")
+        CUDARuntime.event_record(self._event, stream)
+
+    def query(self) -> bool:
+        """Non-blocking check if event completed."""
+        if self._destroyed:
+            raise RuntimeError("Event has been destroyed")
+        return CUDARuntime.event_query(self._event)
+
+    def synchronize(self) -> None:
+        """Wait for the event to complete."""
+        if self._destroyed:
+            raise RuntimeError("Event has been destroyed")
+        CUDARuntime.event_synchronize(self._event)
+
+    def destroy(self) -> None:
+        """Destroy the event."""
+        if not self._destroyed and self._event:
+            CUDARuntime.event_destroy(self._event)
+            self._destroyed = True
+            self._event = 0
+
+    def __del__(self):
+        self.destroy()
+
+
+class StreamEventPool:
+    """
+    Pool of CUDA streams and events for efficient async operations.
+
+    Instead of creating/destroying streams and events for each transfer,
+    this pool maintains a set of reusable resources.
+    """
+
+    def __init__(self, num_streams: int = 4):
+        """
+        Create a stream/event pool.
+
+        Args:
+            num_streams: Number of stream/event pairs to pre-allocate
+        """
+        self._lock = threading.Lock()
+        self._streams: List[int] = []
+        self._events: List[CUDAEvent] = []
+        self._closed = False
+
+        # Pre-allocate streams and events
+        for _ in range(num_streams):
+            self._streams.append(CUDARuntime.stream_create())
+            self._events.append(CUDAEvent(disable_timing=True))
+
+    def acquire(self) -> Tuple[int, CUDAEvent]:
+        """
+        Get a stream/event pair from the pool.
+
+        Returns:
+            Tuple of (stream_handle, CUDAEvent)
+        """
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("Pool has been closed")
+
+            if self._streams and self._events:
+                return self._streams.pop(), self._events.pop()
+
+            # Allocate new if pool exhausted
+            return CUDARuntime.stream_create(), CUDAEvent(disable_timing=True)
+
+    def release(self, stream: int, event: CUDAEvent) -> None:
+        """Return a stream/event pair to the pool."""
+        with self._lock:
+            if not self._closed:
+                self._streams.append(stream)
+                self._events.append(event)
+
+    def close(self) -> None:
+        """Free all resources in the pool."""
+        with self._lock:
+            self._closed = True
+            for stream in self._streams:
+                try:
+                    CUDARuntime.stream_destroy(stream)
+                except Exception:
+                    pass
+            for event in self._events:
+                try:
+                    event.destroy()
+                except Exception:
+                    pass
+            self._streams.clear()
+            self._events.clear()
 
     def __enter__(self):
         return self

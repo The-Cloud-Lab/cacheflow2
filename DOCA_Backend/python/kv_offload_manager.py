@@ -28,17 +28,26 @@ Usage:
 
 import threading
 import time
-from typing import Dict, Optional, Tuple, List, Any
-from dataclasses import dataclass
+from typing import Dict, Optional, Tuple, List, Any, TYPE_CHECKING
+from dataclasses import dataclass, field
 from enum import Enum
 import logging
 
+if TYPE_CHECKING:
+    import torch
+
 # Local imports
 try:
-    from .doca_cuda_utils import PinnedBuffer, PinnedBufferPool, CUDARuntime
+    from .doca_cuda_utils import (
+        PinnedBuffer, PinnedBufferPool, CUDARuntime,
+        CUDAEvent, StreamEventPool
+    )
     from .doca_kv_offload import DOCAKVOffloadClient, find_bluefield_pci_address
 except ImportError:
-    from doca_cuda_utils import PinnedBuffer, PinnedBufferPool, CUDARuntime
+    from doca_cuda_utils import (
+        PinnedBuffer, PinnedBufferPool, CUDARuntime,
+        CUDAEvent, StreamEventPool
+    )
     from doca_kv_offload import DOCAKVOffloadClient, find_bluefield_pci_address
 
 # Try to import torch
@@ -76,6 +85,21 @@ class BlockInfo:
     pending_transfer_size: int = 0
 
 
+@dataclass
+class AsyncTransferHandle:
+    """Handle for tracking async transfers with CUDA events."""
+    block_id: int
+    copy_stream: int
+    copy_event: CUDAEvent
+    doca_transfer_id: Optional[int] = None
+    start_time: float = 0.0
+    size_bytes: int = 0
+    stage: str = "pending"  # pending, copying, transferring, complete
+    pinned_buffer: Optional[PinnedBuffer] = None
+    # For fetch operations
+    dst_tensor: Optional[Any] = None  # torch.Tensor placeholder
+
+
 class KVOffloadManager:
     """
     Manages KV cache offloading between GPU and DPU.
@@ -94,8 +118,10 @@ class KVOffloadManager:
         pci_addr: Optional[str] = None,
         block_size: int = 64 * 1024 * 1024,  # 64MB default block size
         max_blocks: int = 256,
-        num_staging_buffers: int = 4,
+        num_staging_buffers: int = 16,  # Increased from 4
         async_transfers: bool = True,
+        copy_stream_pool_size: int = 4,  # NEW: pool size for async copies
+        overlap_dma: bool = True,  # NEW: overlap GPU->Host with Host->DPU
     ):
         """
         Initialize the KV offload manager.
@@ -131,11 +157,18 @@ class KVOffloadManager:
         self._hash_to_block: Dict[str, int] = {}  # Hash -> block_id for prefix matching
         self._lock = threading.RLock()
 
-        # CUDA stream for async operations
+        # CUDA stream for async operations (legacy)
         if async_transfers:
             self._cuda_stream = CUDARuntime.stream_create()
         else:
             self._cuda_stream = None
+
+        # NEW: Stream/Event pool for true async operations
+        self._stream_event_pool = StreamEventPool(copy_stream_pool_size)
+        self._overlap_dma = overlap_dma
+
+        # NEW: Track pending async operations
+        self._pending_async: Dict[int, AsyncTransferHandle] = {}
 
         # LRU tracking for eviction
         self._lru_order: List[int] = []
@@ -421,6 +454,280 @@ class KVOffloadManager:
         size = dst_tensor.numel() * dst_tensor.element_size()
         self.fetch_block(block_id, dst_tensor.data_ptr(), size, sync)
 
+    # =========================================================================
+    # Async Transfer Methods (Optimized for TTFT)
+    # =========================================================================
+
+    def offload_tensor_async(
+        self,
+        block_id: int,
+        tensor: "torch.Tensor",
+        hash_key: Optional[str] = None,
+    ) -> AsyncTransferHandle:
+        """
+        Non-blocking offload of a PyTorch tensor to DPU.
+
+        This method returns immediately after starting the transfer pipeline:
+        1. Start async GPU->Host copy
+        2. Record CUDA event (no synchronization!)
+        3. Start DOCA DMA transfer (overlapped with remaining copy if enabled)
+        4. Return handle for later synchronization
+
+        Args:
+            block_id: Block identifier
+            tensor: CUDA tensor containing KV data
+            hash_key: Optional hash for prefix matching
+
+        Returns:
+            AsyncTransferHandle for tracking and completing the transfer
+        """
+        if not HAS_TORCH:
+            raise RuntimeError("PyTorch not available")
+
+        if not tensor.is_cuda:
+            raise ValueError("Tensor must be on CUDA device")
+
+        # Ensure contiguous memory layout
+        if not tensor.is_contiguous():
+            tensor = tensor.contiguous()
+
+        size = tensor.numel() * tensor.element_size()
+
+        with self._lock:
+            block = self._get_or_create_block(block_id, size)
+            block.state = BlockState.TRANSFERRING_TO_DPU
+
+            # Acquire stream/event from pool
+            copy_stream, copy_event = self._stream_event_pool.acquire()
+
+            # Acquire staging buffer
+            pinned_buf = self._buffer_pool.acquire()
+            block.pinned_buffer = pinned_buf
+
+            # Async GPU->Host copy (NO synchronization!)
+            CUDARuntime.memcpy_dtoh(
+                pinned_buf.address, tensor.data_ptr(), size,
+                stream=copy_stream
+            )
+
+            # Record event on copy stream - this marks copy completion
+            copy_event.record(copy_stream)
+
+            # Create handle
+            handle = AsyncTransferHandle(
+                block_id=block_id,
+                copy_stream=copy_stream,
+                copy_event=copy_event,
+                start_time=time.perf_counter(),
+                size_bytes=size,
+                stage="copying",
+                pinned_buffer=pinned_buf,
+            )
+
+            if self._overlap_dma:
+                # Wait for copy and immediately start DMA (overlapped approach)
+                copy_event.synchronize()
+                self._start_dma_for_handle(block, handle, size, hash_key)
+            else:
+                # Store for later DMA start
+                self._pending_async[block_id] = handle
+
+            return handle
+
+    def _start_dma_for_handle(
+        self,
+        block: BlockInfo,
+        handle: AsyncTransferHandle,
+        size: int,
+        hash_key: Optional[str]
+    ) -> None:
+        """Start DOCA DMA transfer for a handle."""
+        # Register buffer with DOCA if not already done
+        if block.buffer_id is None:
+            block.buffer_id = self._doca_client.register_buffer(
+                handle.pinned_buffer.address, size
+            )
+
+        # Start Host->DPU transfer (async DOCA)
+        handle.doca_transfer_id = self._doca_client.transfer(
+            block.buffer_id, offset=0, length=size
+        )
+        handle.stage = "transferring"
+
+        # Update hash index for prefix matching
+        if hash_key:
+            block.hash_key = hash_key
+            self._hash_to_block[hash_key] = handle.block_id
+
+        self._pending_async[handle.block_id] = handle
+
+    def complete_offload_async(self, handle: AsyncTransferHandle) -> None:
+        """
+        Complete an async offload operation.
+
+        Waits for both GPU->Host copy and Host->DPU DMA to finish.
+
+        Args:
+            handle: Handle from offload_tensor_async
+        """
+        with self._lock:
+            # Ensure copy is complete
+            if handle.stage == "copying":
+                handle.copy_event.synchronize()
+                block = self._blocks.get(handle.block_id)
+                if block:
+                    self._start_dma_for_handle(
+                        block, handle, handle.size_bytes, block.hash_key
+                    )
+
+            # Wait for DMA
+            if handle.doca_transfer_id is not None:
+                self._doca_client.wait_transfer(handle.doca_transfer_id)
+
+            # Update stats
+            elapsed_ms = (time.perf_counter() - handle.start_time) * 1000.0
+            self._async_wait_ms_total += elapsed_ms
+            self._async_wait_ms_max = max(self._async_wait_ms_max, elapsed_ms)
+            self._async_wait_count += 1
+            self._async_bytes_total += handle.size_bytes
+
+            # Update block state
+            block = self._blocks.get(handle.block_id)
+            if block:
+                block.state = BlockState.ON_DPU
+
+            handle.stage = "complete"
+
+            # Return stream/event to pool
+            self._stream_event_pool.release(handle.copy_stream, handle.copy_event)
+
+            # Remove from pending
+            self._pending_async.pop(handle.block_id, None)
+
+    def fetch_tensor_async(
+        self,
+        block_id: int,
+        dst_tensor: "torch.Tensor",
+    ) -> AsyncTransferHandle:
+        """
+        Start async fetch from DPU to GPU tensor.
+
+        This method returns immediately after starting the DPU->Host transfer.
+        Call complete_fetch_async() to finish the Host->GPU copy.
+
+        Args:
+            block_id: Block identifier
+            dst_tensor: Destination CUDA tensor
+
+        Returns:
+            AsyncTransferHandle for tracking and completing the fetch
+        """
+        if not HAS_TORCH:
+            raise RuntimeError("PyTorch not available")
+
+        if not dst_tensor.is_cuda:
+            raise ValueError("Destination tensor must be on CUDA")
+
+        size = dst_tensor.numel() * dst_tensor.element_size()
+
+        with self._lock:
+            if block_id not in self._blocks:
+                raise KeyError(f"Block {block_id} not found")
+
+            block = self._blocks[block_id]
+
+            if block.state != BlockState.ON_DPU:
+                raise RuntimeError(f"Block {block_id} not on DPU (state={block.state})")
+
+            if block.pinned_buffer is None:
+                raise RuntimeError("Block has no pinned buffer for DPU->Host load")
+
+            # Acquire stream/event from pool
+            copy_stream, copy_event = self._stream_event_pool.acquire()
+
+            block.state = BlockState.TRANSFERRING_TO_GPU
+
+            # Start DPU->Host transfer (async DOCA)
+            doca_transfer_id = self._doca_client.load(
+                block.buffer_id, offset=0, length=size
+            )
+
+            # Create handle
+            handle = AsyncTransferHandle(
+                block_id=block_id,
+                copy_stream=copy_stream,
+                copy_event=copy_event,
+                doca_transfer_id=doca_transfer_id,
+                start_time=time.perf_counter(),
+                size_bytes=size,
+                stage="dpu_to_host",
+                pinned_buffer=block.pinned_buffer,
+                dst_tensor=dst_tensor,
+            )
+
+            self._pending_async[block_id] = handle
+            return handle
+
+    def complete_fetch_async(self, handle: AsyncTransferHandle) -> None:
+        """
+        Complete an async fetch operation.
+
+        Waits for DPU->Host DMA and performs Host->GPU copy.
+
+        Args:
+            handle: Handle from fetch_tensor_async
+        """
+        with self._lock:
+            # Wait for DPU->Host
+            if handle.doca_transfer_id is not None:
+                self._doca_client.wait_transfer(handle.doca_transfer_id)
+
+            # Now do async Host->GPU copy
+            if handle.dst_tensor is not None and handle.pinned_buffer is not None:
+                CUDARuntime.memcpy_htod(
+                    handle.dst_tensor.data_ptr(),
+                    handle.pinned_buffer.address,
+                    handle.size_bytes,
+                    stream=handle.copy_stream
+                )
+
+                # Record completion event
+                handle.copy_event.record(handle.copy_stream)
+
+            handle.stage = "host_to_gpu"
+
+            # Update block state
+            block = self._blocks.get(handle.block_id)
+            if block:
+                block.state = BlockState.ON_GPU
+
+    def wait_fetch_complete(self, handle: AsyncTransferHandle) -> None:
+        """
+        Wait for fetch to fully complete (including Host->GPU copy).
+
+        Args:
+            handle: Handle from fetch_tensor_async
+        """
+        if handle.stage == "dpu_to_host":
+            self.complete_fetch_async(handle)
+
+        # Wait for Host->GPU copy
+        handle.copy_event.synchronize()
+
+        # Update stats
+        elapsed_ms = (time.perf_counter() - handle.start_time) * 1000.0
+        self._async_wait_ms_total += elapsed_ms
+        self._async_wait_ms_max = max(self._async_wait_ms_max, elapsed_ms)
+        self._async_wait_count += 1
+        self._async_bytes_total += handle.size_bytes
+
+        handle.stage = "complete"
+
+        # Return stream/event to pool
+        with self._lock:
+            self._stream_event_pool.release(handle.copy_stream, handle.copy_event)
+            self._pending_async.pop(handle.block_id, None)
+
     def find_by_hash(self, hash_key: str) -> Optional[int]:
         """
         Find a block by its hash key (for prefix matching).
@@ -496,6 +803,10 @@ class KVOffloadManager:
         if self._cuda_stream:
             CUDARuntime.stream_destroy(self._cuda_stream)
             self._cuda_stream = None
+
+        # Close stream/event pool
+        if hasattr(self, '_stream_event_pool'):
+            self._stream_event_pool.close()
 
         # Close buffer pool
         self._buffer_pool.close()

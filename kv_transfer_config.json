@@ -1,18 +1,19 @@
 {
-    "kv_connector": "CacheFlowConnectorV1",
-    "kv_role": "kv_both",
-    "common_prefix_num_tokens": 256,
-    "kv_connector_extra_config": {
-      "dpu_pci_addr": "0000:0c:00.0",
-      "block_size": 67108864,
-      "max_blocks": 256,
-      "tokens_per_block": 1024,
-      "num_staging_buffers": 4,
-      "async_transfers": true,
-      "offload_full_prompt": false,
-      "min_cached_tokens": 256,
-      "skip_save_if_prefix_cached": true,
-      "load_prefix_map": true,
-      "prefix_map_path": "/tmp/cacheflow_prefix_map.json"
-    }
+  "kv_connector": "CacheFlowConnectorV1",
+  "kv_role": "kv_both",
+  "common_prefix_num_tokens": 10000,
+  "kv_connector_extra_config": {
+    "dpu_pci_addr": "0000:0c:00.0",
+    "block_size": 67108864,
+    "max_blocks": 256,
+    "tokens_per_block": 1024,
+    "num_staging_buffers": 4,
+    "async_transfers": true,
+    "max_transfer_bytes": 2097152,
+    "offload_full_prompt": false,
+    "min_cached_tokens": 1000,
+    "skip_save_if_prefix_cached": true,
+    "load_prefix_map": true,
+    "prefix_map_path": "/tmp/cacheflow_prefix_map.json"
   }
+}

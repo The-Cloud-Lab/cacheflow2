@@ -268,26 +268,48 @@ class DOCAConnectorV1(KVConnectorBase_V1):
             return False, None
 
     # ---- Worker-side ----
-    def start_load_kv(self, forward_context, **kwargs):
+    def start_load_kv(self, layer_name: str, kv_layer: torch.Tensor, 
+                     attn_metadata, **kwargs):
         """
-        Start loading KV cache from DPU to vLLM's paged buffer.
-        
-        This is called before the forward pass. We extract the metadata
-        and initiate DMA transfers from DPU to GPU.
+        Worker-side: Fills the GPU KV cache from DPU before the model runs.
         """
         metadata = self._get_connector_metadata()
         if not metadata or not metadata.load_specs:
             return
         
-        # Get attention metadata from forward context
-        attn_metadata = forward_context.attn_metadata
-        if isinstance(attn_metadata, dict):
-            # V1 API: one metadata per layer
-            # We'll handle loading in wait_for_layer_load
-            pass
-        else:
-            # Single metadata for all layers
-            self._load_kv_from_metadata(attn_metadata, metadata.load_specs)
+        for req_id, load_spec in metadata.load_specs.items():
+            # Skip if scheduler didn't authorize a load or block_id is missing
+            if not load_spec.can_load or load_spec.block_id is None:
+                continue
+            
+            try:
+                # 1. Get the physical block table from vLLM's internal metadata
+                block_table = self._extract_block_table(attn_metadata, req_id)
+                if block_table is None:
+                    continue
+                
+                # 2. Map logical block 0 to the physical GPU block assigned by vLLM
+                # block_table shape is [num_reqs, max_blocks]
+                physical_block_id = block_table[0, 0].item() if torch.is_tensor(block_table) else block_table[0][0]
+                
+                # 3. Perform the actual DMA Transfer (DPU -> GPU)
+                logger.info(f"[CacheFlow] Loading {layer_name} from DPU block {load_spec.block_id} "
+                            f"to physical block {physical_block_id}")
+                
+                self._manager.fetch_tensor(
+                    block_id=load_spec.block_id,
+                    dst_tensor=kv_layer[physical_block_id], # Destination is the specific GPU block
+                    sync=True
+                )
+                
+                # Track that this request is no longer "pending" a load
+                if req_id not in self._pending_loads:
+                    self._pending_loads[req_id] = {}
+                self._pending_loads[req_id][layer_name] = kv_layer[physical_block_id]
+
+            except Exception as e:
+                logger.error(f"[CacheFlow] DMA Load failed for {req_id} at {layer_name}: {e}")
+                self._load_errors.add(load_spec.block_id)
 
     def wait_for_layer_load(self, layer_name: str):
         """

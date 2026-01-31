@@ -623,6 +623,7 @@ class CacheFlowConnectorV1(KVConnectorBase_V1):
                 else (self.common_prefix_num_tokens or len(token_ids))
             )
             cached_tokens = min(hash_len, len(token_ids))
+            
             if cached_tokens <= num_computed_tokens:
                 # Nothing new to load beyond local cache.
                 if req_id in self._request_trackers:
@@ -634,7 +635,7 @@ class CacheFlowConnectorV1(KVConnectorBase_V1):
 
             prefix_hash = compute_prefix_hash(token_ids, cached_tokens)
 
-            # Create tracker for new requests
+            # Create/update tracker for requests
             if req_id not in self._request_trackers:
                 self._request_trackers[req_id] = RequestTracker(
                     req_id=req_id,
@@ -644,29 +645,63 @@ class CacheFlowConnectorV1(KVConnectorBase_V1):
                     prefix_hash=prefix_hash,
                     cached_tokens=cached_tokens,
                 )
-                logger.info(f"[CacheFlow] New request tracked: {req_id}, {len(token_ids)} tokens, hash={prefix_hash[:8]}...")
             else:
-                self._request_trackers[req_id].prefix_hash = prefix_hash
-                self._request_trackers[req_id].cached_tokens = cached_tokens
+                tracker = self._request_trackers[req_id]
+                tracker.prefix_hash = prefix_hash
+                tracker.cached_tokens = cached_tokens
 
             tracker = self._request_trackers[req_id]
             dpu_block_id = self._hash_to_dpu_block.get(prefix_hash)
+            
             if dpu_block_id is not None:
                 self._record_prefix_use(prefix_hash)
-                # NOTE: Load path disabled - KV data layout mismatch causes corruption.
-                # Saves still work, but we don't report matched tokens to avoid loading.
-                # TODO: Fix KV cache layout/injection to match vLLM's expected format.
-                logger.info(
-                    f"[CacheFlow] Prefix exists for {req_id}: hash={prefix_hash[:8]}..., "
-                    f"DPU block {dpu_block_id} (load disabled, save-only mode)"
-                )
-                # Don't set is_loading or report matched tokens - save-only mode
-                return 0, False
 
-            # Clear any stale load state if the prefix is no longer mapped.
-            if tracker.is_loading or tracker.dpu_block_id is not None:
-                tracker.is_loading = False
-                tracker.dpu_block_id = None
+                # CRITICAL: vLLM requires at least 1 new token to compute.
+                # We cannot claim ALL tokens are cached, or we get:
+                #   assert num_new_tokens > 0  (fails when cached == prompt_len)
+                #
+                # The formula is:
+                #   num_new_tokens = prompt_len - num_computed_tokens - external_tokens
+                # We need num_new_tokens >= 1, so:
+                #   external_tokens <= prompt_len - num_computed_tokens - 1
+                #
+                # num_computed_tokens = tokens already cached by vLLM's internal prefix cache
+                prompt_len = len(token_ids)
+                max_external_tokens = prompt_len - num_computed_tokens - 1
+                effective_cached_tokens = min(cached_tokens, max_external_tokens)
+
+                if effective_cached_tokens <= 0:
+                    # Either prompt too short or vLLM already cached most of it
+                    logger.debug(
+                        f"[CacheFlow] Prefix HIT for {req_id} but no room for external tokens "
+                        f"(prompt_len={prompt_len}, vllm_cached={num_computed_tokens}), skipping load."
+                    )
+                    tracker.is_loading = False
+                    tracker.dpu_block_id = None
+                    return 0, False
+
+                logger.info(
+                    f"[CacheFlow] Prefix HIT for {req_id}: hash={prefix_hash[:8]}..., "
+                    f"DPU block {dpu_block_id}. Will load {effective_cached_tokens}/{cached_tokens} tokens "
+                    f"(prompt_len={prompt_len}, vllm_cached={num_computed_tokens})."
+                )
+
+                tracker.is_loading = True
+                tracker.dpu_block_id = dpu_block_id
+                tracker.cached_tokens = effective_cached_tokens
+
+                # CRITICAL: Return is_async=False (not True!)
+                # If we return True, vLLM puts request in WAITING_FOR_REMOTE_KVS
+                # and doesn't schedule it, so build_connector_meta never runs,
+                # and we never get load_specs. This causes a deadlock.
+                # By returning False, vLLM proceeds to schedule the request,
+                # build_connector_meta creates load_specs, and start_load_kv
+                # loads the data before the forward pass.
+                return effective_cached_tokens, False
+
+            # If no hit, clear any stale loading state
+            tracker.is_loading = False
+            tracker.dpu_block_id = None
 
             return 0, False
 
@@ -746,7 +781,38 @@ class CacheFlowConnectorV1(KVConnectorBase_V1):
                 if req_id in self._request_trackers:
                     tracker = self._request_trackers[req_id]
 
-                    # Create save spec for offloading
+                    # Create load spec FIRST if we detected a prefix hit
+                    # (load takes priority over save for the same request)
+                    if tracker.is_loading and tracker.dpu_block_id is not None:
+                        # Revalidate mapping to avoid stale prefix hits.
+                        current_block = self._hash_to_dpu_block.get(tracker.prefix_hash or "")
+                        if current_block != tracker.dpu_block_id:
+                            logger.warning(
+                                f"[CacheFlow] Stale prefix mapping for {req_id}: "
+                                f"expected block {tracker.dpu_block_id}, current mapping is {current_block}. "
+                                f"Disabling load."
+                            )
+                            tracker.is_loading = False
+                            tracker.dpu_block_id = None
+                        else:
+                            cached_tokens = tracker.cached_tokens or len(tracker.token_ids)
+                            load_specs[req_id] = LoadSpec(
+                                vllm_cached_tokens=0,
+                                dpu_cached_tokens=cached_tokens,
+                                can_load=True,
+                                block_id=tracker.dpu_block_id,
+                                prefix_hash=tracker.prefix_hash,
+                                block_ids=tracker.allocated_block_ids.copy(),
+                            )
+                            logger.info(
+                                f"[CacheFlow] Created load_spec for {req_id}: "
+                                f"dpu_block_id={tracker.dpu_block_id}, hash={tracker.prefix_hash[:8]}..., "
+                                f"cached_tokens={cached_tokens}"
+                            )
+                            # Skip save spec for requests that are loading
+                            continue
+
+                    # Create save spec for offloading (only if not loading)
                     save_specs[req_id] = SaveSpec(
                         skip_leading_tokens=tracker.num_saved_tokens,
                         can_save=True,
@@ -755,28 +821,6 @@ class CacheFlowConnectorV1(KVConnectorBase_V1):
                         block_ids=tracker.allocated_block_ids.copy(),
                     )
                     logger.info(f"[CacheFlow] Created save_spec for {req_id}: {len(tracker.token_ids)} tokens, {len(tracker.allocated_block_ids)} blocks")
-
-                    # Create load spec if we detected a prefix hit
-                    if tracker.is_loading and tracker.dpu_block_id is not None:
-                        # Revalidate mapping to avoid stale prefix hits.
-                        current_block = self._hash_to_dpu_block.get(tracker.prefix_hash or "")
-                        if current_block != tracker.dpu_block_id:
-                            tracker.is_loading = False
-                            tracker.dpu_block_id = None
-                            continue
-                        cached_tokens = tracker.cached_tokens or len(tracker.token_ids)
-                        load_specs[req_id] = LoadSpec(
-                            vllm_cached_tokens=0,
-                            dpu_cached_tokens=cached_tokens,
-                            can_load=True,
-                            block_id=tracker.dpu_block_id,
-                            prefix_hash=tracker.prefix_hash,
-                            block_ids=tracker.allocated_block_ids.copy(),
-                        )
-                        logger.info(
-                            f"[CacheFlow] Created load_spec for {req_id}: "
-                            f"dpu_block_id={tracker.dpu_block_id}, hash={tracker.prefix_hash[:8]}..."
-                        )
 
             # Process cached/running requests (CachedRequestData has parallel lists)
             if cached_req_data and cached_req_data.req_ids:
@@ -794,25 +838,33 @@ class CacheFlowConnectorV1(KVConnectorBase_V1):
                             # Revalidate mapping to avoid stale prefix hits.
                             current_block = self._hash_to_dpu_block.get(tracker.prefix_hash or "")
                             if current_block != tracker.dpu_block_id:
+                                logger.warning(
+                                    f"[CacheFlow] Stale prefix mapping for cached {req_id}: "
+                                    f"expected block {tracker.dpu_block_id}, current is {current_block}"
+                                )
                                 tracker.is_loading = False
                                 tracker.dpu_block_id = None
-                                continue
-                            cached_tokens = tracker.cached_tokens or len(tracker.token_ids)
-                            load_specs[req_id] = LoadSpec(
-                                vllm_cached_tokens=0,
-                                dpu_cached_tokens=cached_tokens,
-                                can_load=True,
-                                block_id=tracker.dpu_block_id,
-                                prefix_hash=tracker.prefix_hash,
-                                block_ids=tracker.allocated_block_ids.copy(),
-                            )
-                            logger.info(
-                                f"[CacheFlow] Created load_spec for cached {req_id}: "
-                                f"dpu_block_id={tracker.dpu_block_id}, hash={tracker.prefix_hash[:8]}..."
-                            )
+                                # Don't use continue here - just skip the load spec creation
+                            else:
+                                cached_tokens = tracker.cached_tokens or len(tracker.token_ids)
+                                load_specs[req_id] = LoadSpec(
+                                    vllm_cached_tokens=0,
+                                    dpu_cached_tokens=cached_tokens,
+                                    can_load=True,
+                                    block_id=tracker.dpu_block_id,
+                                    prefix_hash=tracker.prefix_hash,
+                                    block_ids=tracker.allocated_block_ids.copy(),
+                                )
+                                logger.info(
+                                    f"[CacheFlow] Created load_spec for cached {req_id}: "
+                                    f"dpu_block_id={tracker.dpu_block_id}, hash={tracker.prefix_hash[:8]}..."
+                                )
 
+            # Log summary of what we're returning
+            if load_specs:
+                logger.info(f"[CacheFlow] Returning metadata with {len(load_specs)} load_specs: {list(load_specs.keys())}")
             if save_specs:
-                logger.info(f"[CacheFlow] Returning metadata with {len(save_specs)} save_specs")
+                logger.info(f"[CacheFlow] Returning metadata with {len(save_specs)} save_specs: {list(save_specs.keys())}")
 
             return CacheFlowConnectorMetadata(
                 load_specs=load_specs,
@@ -850,6 +902,65 @@ class CacheFlowConnectorV1(KVConnectorBase_V1):
     # Worker-side methods
     # ========================================================================
 
+    def _convert_metadata(
+        self, raw_metadata: Any
+    ) -> Optional[CacheFlowConnectorMetadata]:
+        """
+        Convert raw metadata to CacheFlowConnectorMetadata.
+
+        Handles cases where metadata is serialized as dict or has dict LoadSpec/SaveSpec.
+        """
+        if isinstance(raw_metadata, CacheFlowConnectorMetadata):
+            return raw_metadata
+
+        if isinstance(raw_metadata, dict):
+            # Convert dict load_specs to LoadSpec objects
+            load_specs = {}
+            raw_load_specs = raw_metadata.get('load_specs', {})
+            for req_id, spec in raw_load_specs.items():
+                if isinstance(spec, LoadSpec):
+                    load_specs[req_id] = spec
+                elif isinstance(spec, dict):
+                    load_specs[req_id] = LoadSpec(
+                        vllm_cached_tokens=spec.get('vllm_cached_tokens', 0),
+                        dpu_cached_tokens=spec.get('dpu_cached_tokens', 0),
+                        can_load=spec.get('can_load', False),
+                        block_id=spec.get('block_id'),
+                        prefix_hash=spec.get('prefix_hash'),
+                        block_ids=spec.get('block_ids', []),
+                    )
+
+            # Convert dict save_specs to SaveSpec objects
+            save_specs = {}
+            raw_save_specs = raw_metadata.get('save_specs', {})
+            for req_id, spec in raw_save_specs.items():
+                if isinstance(spec, SaveSpec):
+                    save_specs[req_id] = spec
+                elif isinstance(spec, dict):
+                    save_specs[req_id] = SaveSpec(
+                        skip_leading_tokens=spec.get('skip_leading_tokens', 0),
+                        can_save=spec.get('can_save', False),
+                        req_id=spec.get('req_id', ''),
+                        token_ids=spec.get('token_ids', []),
+                        block_ids=spec.get('block_ids', []),
+                    )
+
+            return CacheFlowConnectorMetadata(
+                load_specs=load_specs,
+                save_specs=save_specs,
+                request_row_indices=raw_metadata.get('request_row_indices', {}),
+            )
+
+        # Check if it has the expected attributes (duck typing)
+        if hasattr(raw_metadata, 'load_specs') and hasattr(raw_metadata, 'save_specs'):
+            return CacheFlowConnectorMetadata(
+                load_specs=getattr(raw_metadata, 'load_specs', {}),
+                save_specs=getattr(raw_metadata, 'save_specs', {}),
+                request_row_indices=getattr(raw_metadata, 'request_row_indices', {}),
+            )
+
+        return None
+
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         """Register KV caches with the connector."""
         self._kv_caches = kv_caches
@@ -866,16 +977,21 @@ class CacheFlowConnectorV1(KVConnectorBase_V1):
         Phase 4 optimization: Start async fetch and return immediately.
         Actual data injection happens in wait_for_layer_load().
         """
-        metadata = self._get_connector_metadata()
-        if not isinstance(metadata, CacheFlowConnectorMetadata):
+        raw_metadata = self._get_connector_metadata()
+        metadata = self._convert_metadata(raw_metadata)
+        if metadata is None:
+            logger.warning(f"[CacheFlow] start_load_kv: failed to convert metadata type: {type(raw_metadata)}")
             return
 
         if not metadata.load_specs:
+            logger.debug("[CacheFlow] start_load_kv: no load_specs in metadata")
             return
 
         if self._manager is None:
             logger.warning("[CacheFlow] DOCA manager not initialized, cannot load KV")
             return
+
+        logger.info(f"[CacheFlow] start_load_kv called with {len(metadata.load_specs)} load_specs: {list(metadata.load_specs.keys())}")
 
         attn_metadata = forward_context.attn_metadata
         if isinstance(attn_metadata, list):
@@ -885,30 +1001,47 @@ class CacheFlowConnectorV1(KVConnectorBase_V1):
         self._current_attn_metadata = attn_metadata
 
         layer_order = self._get_layer_order()
+        if not layer_order:
+            logger.warning("[CacheFlow] start_load_kv: no layers registered in _kv_caches")
+            return
+
+        logger.info(f"[CacheFlow] start_load_kv: {len(layer_order)} layers to process")
+
         for req_id, load_spec in metadata.load_specs.items():
             if not load_spec.can_load or load_spec.block_id is None:
+                logger.debug(f"[CacheFlow] Skipping load for {req_id}: can_load={load_spec.can_load}, block_id={load_spec.block_id}")
                 continue
 
             try:
                 self._stats["load_attempts"] += 1
+                logger.info(f"[CacheFlow] Processing load for {req_id}: block_id={load_spec.block_id}, cached_tokens={load_spec.dpu_cached_tokens}")
 
                 # Check if block exists on DPU
-                if not self._manager.has_block(load_spec.block_id):
+                has_block = self._manager.has_block(load_spec.block_id)
+                logger.info(f"[CacheFlow] Block {load_spec.block_id} present on DPU: {has_block}")
+
+                if not has_block:
+                    logger.info(f"[CacheFlow] Waiting for pending transfers for block {load_spec.block_id}")
                     self._manager.wait_for_pending_transfers([load_spec.block_id])
-                if not self._manager.has_block(load_spec.block_id):
+                    has_block = self._manager.has_block(load_spec.block_id)
+                    logger.info(f"[CacheFlow] After wait, block {load_spec.block_id} present: {has_block}")
+
+                if not has_block:
                     logger.warning(
-                        f"[CacheFlow] DPU block {load_spec.block_id} not present; "
-                        f"skipping load for {req_id}"
+                        f"[CacheFlow] DPU block {load_spec.block_id} not present after waiting; "
+                        f"skipping load for {req_id}. This may indicate the prefix was never saved."
                     )
                     if load_spec.prefix_hash:
                         self._evict_prefix(load_spec.prefix_hash)
                         self._persist_prefix_map()
+                    self._stats["load_fail"] += 1
                     continue
 
                 # Compute layer slices and total size
                 kv_layer_slices: List[Tuple[str, torch.Tensor, torch.Tensor, Tuple[int, ...]]] = []
                 total_elems = 0
                 cached_tokens = load_spec.dpu_cached_tokens
+                skipped_layers = []
 
                 for layer_name in layer_order:
                     kv_layer = self._kv_caches[layer_name]
@@ -917,6 +1050,10 @@ class CacheFlowConnectorV1(KVConnectorBase_V1):
                     )
                     if slot_mapping is None or slot_mapping.numel() == 0:
                         block_table = self._get_block_table(attn_metadata)
+                        if block_table is None:
+                            logger.warning(f"[CacheFlow] No block_table in attn_metadata for {req_id}")
+                            skipped_layers.append(layer_name)
+                            continue
                         row_index = self._resolve_row_index(
                             block_table,
                             load_spec.block_ids,
@@ -929,6 +1066,8 @@ class CacheFlowConnectorV1(KVConnectorBase_V1):
                             kv_layer.device,
                         )
                         if slot_mapping is None or slot_mapping.numel() == 0:
+                            logger.warning(f"[CacheFlow] Failed to build slot_mapping for layer {layer_name}, req {req_id}")
+                            skipped_layers.append(layer_name)
                             continue
 
                     slot_mapping = slot_mapping[:cached_tokens]
@@ -942,8 +1081,18 @@ class CacheFlowConnectorV1(KVConnectorBase_V1):
                     kv_layer_slices.append((layer_name, kv_layer, slot_mapping, kv_shape))
                     total_elems += numel
 
+                if skipped_layers:
+                    logger.warning(f"[CacheFlow] Skipped {len(skipped_layers)} layers for {req_id}: {skipped_layers[:3]}...")
+
                 if total_elems <= 0:
+                    logger.error(
+                        f"[CacheFlow] No KV data to load for {req_id}: total_elems=0. "
+                        f"This likely means slot_mapping failed for all {len(layer_order)} layers."
+                    )
+                    self._stats["load_fail"] += 1
                     continue
+
+                logger.info(f"[CacheFlow] Loading {len(kv_layer_slices)} layers, {total_elems} total elements for {req_id}")
 
                 # Allocate combined destination buffer
                 first_layer = next(iter(self._kv_caches.values()))
@@ -962,10 +1111,11 @@ class CacheFlowConnectorV1(KVConnectorBase_V1):
                     )
                     logger.info(
                         f"[CacheFlow] Started async load for {req_id} from DPU block "
-                        f"{load_spec.block_id}, {total_elems} elements"
+                        f"{load_spec.block_id}, {total_elems} elements, {len(kv_layer_slices)} layers"
                     )
                 else:
                     # Fallback to sync fetch
+                    logger.info(f"[CacheFlow] Starting sync fetch for {req_id} from block {load_spec.block_id}")
                     self._manager.fetch_tensor(load_spec.block_id, combined, sync=True)
                     logger.info(
                         f"[CacheFlow] Sync loaded KV for {req_id} from DPU block "
@@ -993,56 +1143,78 @@ class CacheFlowConnectorV1(KVConnectorBase_V1):
         """
         Wait for layer load to complete and inject data.
 
-        Phase 4 optimization: Complete async transfer and inject all layers
-        at once on first call.
+        Note: This is called once per layer, but we process all layers in the
+        first call since the DMA transfer fetches all layers at once.
         """
         if not self._pending_load_handles:
             return
 
         attn_metadata = getattr(self, '_current_attn_metadata', None)
         if attn_metadata is None:
+            logger.warning("[CacheFlow] wait_for_layer_load: no attn_metadata stored")
             return
 
-        # Process all pending loads
         completed_reqs = []
-        for req_id, pending in self._pending_load_handles.items():
+        for req_id, pending in list(self._pending_load_handles.items()):
             if not pending.load_started:
+                logger.debug(f"[CacheFlow] wait_for_layer_load: {req_id} load not started")
+                continue
+
+            # Skip if already processed (subsequent layer calls)
+            if req_id in self._pending_loads:
                 continue
 
             try:
-                # Complete async transfer if not done
+                # 1. Complete async transfer
                 if not pending.load_completed and pending.handle is not None:
+                    logger.info(f"[CacheFlow] Waiting for async fetch to complete for {req_id}")
                     if hasattr(self._manager, 'wait_fetch_complete'):
                         self._manager.wait_fetch_complete(pending.handle)
-                    elif hasattr(self._manager, 'complete_fetch_async'):
-                        self._manager.complete_fetch_async(pending.handle)
                     pending.load_completed = True
+                    logger.info(f"[CacheFlow] Async fetch completed for {req_id}")
 
-                # Inject all layer data from combined buffer
+                # 2. Inject layer data from combined buffer
                 offset = 0
+                injected_layers = 0
                 for lname, kv_layer, slot_mapping, kv_shape in pending.layer_slices:
                     numel = int(math.prod(kv_shape))
-                    kv_cache = pending.combined_buffer[offset:offset + numel].view(kv_shape)
+
+                    if offset + numel > pending.combined_buffer.numel():
+                        logger.error(
+                            f"[CacheFlow] BUFFER OVERFLOW: Layer {lname}, "
+                            f"offset={offset}, numel={numel}, buffer_size={pending.combined_buffer.numel()}"
+                        )
+                        break
+
+                    kv_cache_slice = pending.combined_buffer[offset:offset + numel].view(kv_shape)
                     offset += numel
+
+                    # Only warn on first layer if all zeros (to avoid log spam)
+                    if injected_layers == 0 and torch.all(kv_cache_slice == 0):
+                        logger.warning(
+                            f"[CacheFlow] Potential Data Corruption: Layer {lname} is all zeros. "
+                            f"This may indicate the DPU block was not properly saved."
+                        )
+
+                    # Inject KV data into the GPU paged memory
                     self._inject_kv_into_layer(
-                        kv_layer, kv_cache, slot_mapping, attn_metadata
+                        kv_layer, kv_cache_slice, slot_mapping, attn_metadata
                     )
+                    injected_layers += 1
 
                 self._pending_loads[req_id] = True
                 self._stats["load_success"] += 1
                 logger.info(
-                    f"[CacheFlow] Completed async load for {req_id} from DPU block "
-                    f"{pending.block_id}"
+                    f"[CacheFlow] Successfully loaded and injected KV for {req_id} "
+                    f"from DPU block {pending.block_id}, {injected_layers} layers"
                 )
                 completed_reqs.append(req_id)
 
             except Exception as e:
                 self._stats["load_fail"] += 1
-                logger.error(f"[CacheFlow] Failed to complete load for {req_id}: {e}")
-                self._load_errors.add(pending.block_id)
+                logger.error(f"[CacheFlow] Load failed for {req_id}: {e}", exc_info=True)
                 completed_reqs.append(req_id)
 
-        # Cleanup completed loads
         for req_id in completed_reqs:
             self._pending_load_handles.pop(req_id, None)
 
@@ -1249,19 +1421,27 @@ class CacheFlowConnectorV1(KVConnectorBase_V1):
         Phase 3 optimization: Pre-allocate combined buffer and write layers
         directly into it, eliminating torch.cat() overhead.
         """
-        metadata = self._get_connector_metadata()
-        if not isinstance(metadata, CacheFlowConnectorMetadata):
+        raw_metadata = self._get_connector_metadata()
+        metadata = self._convert_metadata(raw_metadata)
+        if metadata is None:
+            logger.debug(f"[CacheFlow] save_kv_layer({layer_name}): no metadata")
             return
 
         if not metadata.save_specs:
+            logger.debug(f"[CacheFlow] save_kv_layer({layer_name}): no save_specs in metadata")
             return
 
         if not self._kv_caches:
+            logger.warning(f"[CacheFlow] save_kv_layer({layer_name}): no KV caches registered")
             return
 
         if self._manager is None:
             logger.warning("[CacheFlow] DOCA manager not initialized, cannot save KV")
             return
+
+        # Log only on first layer to avoid spam
+        if layer_name == self._get_layer_order()[0] if self._get_layer_order() else True:
+            logger.info(f"[CacheFlow] save_kv_layer: processing {len(metadata.save_specs)} save_specs")
 
         # Process each request's save spec
         for req_id, save_spec in metadata.save_specs.items():
@@ -1290,8 +1470,13 @@ class CacheFlowConnectorV1(KVConnectorBase_V1):
                         req_id, save_spec, kv_layer, attn_metadata
                     )
                     if batch is None:
+                        logger.warning(
+                            f"[CacheFlow] save_kv_layer: failed to init batch for {req_id}, "
+                            f"token_ids={len(save_spec.token_ids)}, common_prefix={self.common_prefix_num_tokens}"
+                        )
                         continue
                     self._zero_copy_batches[req_id] = batch
+                    logger.info(f"[CacheFlow] save_kv_layer: initialized batch for {req_id}, cached_tokens={batch.cached_tokens}")
 
                 batch = self._zero_copy_batches[req_id]
 

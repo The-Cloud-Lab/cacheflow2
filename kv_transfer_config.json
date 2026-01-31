@@ -4,7 +4,7 @@
   "common_prefix_num_tokens": 1024,
   "kv_connector_extra_config": {
     "dpu_pci_addr": "0000:0c:00.0",
-    "tokens_per_block": 256,
+    "tokens_per_block": 16,
     "num_kv_heads": 32,
     "head_dim": 128,
     "dtype_size": 2,

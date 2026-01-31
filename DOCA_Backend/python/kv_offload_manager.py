@@ -438,12 +438,7 @@ class KVOffloadManager:
         sync: bool = True
     ) -> None:
         """
-        Fetch KV data into a PyTorch tensor.
-
-        Args:
-            block_id: Block identifier
-            dst_tensor: Destination CUDA tensor
-            sync: Wait for completion
+        Fetch KV data from DPU back into a PyTorch CUDA tensor.
         """
         if not HAS_TORCH:
             raise RuntimeError("PyTorch not available")
@@ -451,9 +446,15 @@ class KVOffloadManager:
         if not dst_tensor.is_cuda:
             raise ValueError("Destination tensor must be on CUDA")
 
-        size = dst_tensor.numel() * dst_tensor.element_size()
-        self.fetch_block(block_id, dst_tensor.data_ptr(), size, sync)
+        # Ensure the tensor is contiguous for DMA
+        if not dst_tensor.is_contiguous():
+            dst_tensor = dst_tensor.contiguous()
 
+        # Calculate exact byte size (e.g., [16, 8, 128] * 2 bytes for bfloat16)
+        size = dst_tensor.numel() * dst_tensor.element_size()
+        
+        # Trigger the DPU -> Host -> GPU pipeline defined in fetch_block
+        self.fetch_block(block_id, dst_tensor.data_ptr(), size, sync)
     # =========================================================================
     # Async Transfer Methods (Optimized for TTFT)
     # =========================================================================

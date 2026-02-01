@@ -1246,11 +1246,23 @@ class CacheFlowConnectorV1(KVConnectorBase_V1):
             if self._offload_full_prompt
             else (self.common_prefix_num_tokens or len(save_spec.token_ids))
         )
+
+        # CRITICAL: Cap by actual block capacity to avoid tensor size mismatch
+        # The request may have fewer blocks allocated than tokens desired
+        block_capacity = len(save_spec.block_ids) * self.kv_block_size if save_spec.block_ids else 0
+
         cached_tokens = min(
             desired_tokens,
             int(slot_mapping.numel()) if slot_mapping is not None else desired_tokens,
+            block_capacity if block_capacity > 0 else desired_tokens,
         )
+
         if cached_tokens <= 0:
+            logger.debug(
+                f"[CacheFlow] _init_zero_copy_batch({req_id}): cached_tokens=0 "
+                f"(desired={desired_tokens}, slot_mapping={slot_mapping.numel() if slot_mapping is not None else 'None'}, "
+                f"block_capacity={block_capacity})"
+            )
             return None
         if self._min_cached_tokens and cached_tokens < self._min_cached_tokens:
             return None

@@ -1,24 +1,21 @@
 {
-  "kv_connector": "CacheFlowConnectorV1",
-  "kv_role": "kv_both",
-  "common_prefix_num_tokens": 1024,
-  "kv_connector_extra_config": {
-    "dpu_pci_addr": "0000:0c:00.0",
-    "tokens_per_block": 16,
-    "num_kv_heads": 32,
-    "head_dim": 128,
-    "dtype_size": 2,
-    "block_size": 16777216,
-    "max_blocks": 64,
-    "num_staging_buffers": 16,
-    "async_transfers": true,
-    "copy_stream_pool_size": 4,
-    "overlap_dma_with_copy": true,
-    "max_transfer_bytes": 2097152,
-    "offload_full_prompt": true,
-    "min_cached_tokens": 64,
-    "skip_save_if_prefix_cached": true,
-    "load_prefix_map": true,
-    "prefix_map_path": "/tmp/cacheflow_prefix_map.json"
-  }
+    "kv_connector": "CacheFlowConnectorV1",
+    "kv_role": "kv_both",
+    "kv_rank": 0,
+    "kv_parallel_size": 1,
+    "kv_buffer_device": "cuda",
+    "kv_buffer_size": 2000000000.0,
+    "kv_connector_extra_config": {
+        "dpu_pci_addr": "0000:0c:00.0",
+        "tokens_per_block": 16384,
+        "block_size": 1073741824,
+        "max_blocks": 30,
+        "common_prefix_num_tokens": 14999,
+        "num_staging_buffers": 8,
+        "async_transfers": true,
+        "copy_stream_pool_size": 4,
+        "overlap_dma_with_copy": true,
+        "load_prefix_map": true,
+        "prefix_map_path": "/tmp/cacheflow_prefix_map.json"
+    }
 }

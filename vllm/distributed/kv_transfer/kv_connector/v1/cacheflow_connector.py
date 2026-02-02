@@ -365,6 +365,11 @@ class CacheFlowConnectorV1(KVConnectorBase_V1):
         self._prefix_map_path = self._get_prefix_map_path(extra_config)
         self._load_prefix_map(extra_config)
 
+        # CRITICAL: Sync prefix map with KVOffloadManager on worker side
+        # This registers external blocks so has_block() returns True for cached prefixes
+        if self._manager is not None and self._hash_to_dpu_block:
+            self._sync_prefix_map_with_manager()
+
         logger.info(
             f"CacheFlowConnectorV1 initialized: role={role.name}, "
             f"num_layers={self.num_layers}, kv_block_size={self.kv_block_size}, "
@@ -446,12 +451,51 @@ class CacheFlowConnectorV1(KVConnectorBase_V1):
                 self._prefix_lru = OrderedDict(
                     (str(k), None) for k in self._hash_to_dpu_block.keys()
                 )
+                # Log first few hashes for debugging
+                sample_hashes = list(self._hash_to_dpu_block.keys())[:5]
                 logger.info(
                     f"[CacheFlow] Loaded {len(self._hash_to_dpu_block)} prefix mappings "
-                    f"from {self._prefix_map_path}"
+                    f"from {self._prefix_map_path}. Sample hashes: {[h[:8] + '...' for h in sample_hashes]}"
                 )
         except Exception as e:
             logger.warning(f"[CacheFlow] Failed to load prefix map: {e}")
+
+    def _sync_prefix_map_with_manager(self) -> None:
+        """
+        Sync the loaded prefix map with the KVOffloadManager.
+
+        This is critical for external KV cache hits - the manager needs to know
+        about blocks from previous sessions so has_block() returns True.
+        """
+        if self._manager is None:
+            return
+        if not self._hash_to_dpu_block:
+            return
+
+        try:
+            # Check if manager supports external block registration
+            if hasattr(self._manager, 'register_external_blocks_from_map'):
+                registered = self._manager.register_external_blocks_from_map(
+                    self._hash_to_dpu_block
+                )
+                logger.info(
+                    f"[CacheFlow] Synced {registered} prefix mappings with KVOffloadManager"
+                )
+            else:
+                # Fallback: register one by one
+                registered = 0
+                for hash_key, block_id in self._hash_to_dpu_block.items():
+                    if hasattr(self._manager, 'register_external_block'):
+                        if self._manager.register_external_block(
+                            int(block_id), str(hash_key)
+                        ):
+                            registered += 1
+                logger.info(
+                    f"[CacheFlow] Synced {registered}/{len(self._hash_to_dpu_block)} "
+                    f"prefix mappings with KVOffloadManager (fallback mode)"
+                )
+        except Exception as e:
+            logger.warning(f"[CacheFlow] Failed to sync prefix map with manager: {e}")
 
     def _refresh_prefix_map_if_needed(self) -> None:
         if not self._load_prefix_map_enabled:
@@ -479,6 +523,8 @@ class CacheFlowConnectorV1(KVConnectorBase_V1):
                     f"[CacheFlow] Refreshed prefix map "
                     f"({len(self._hash_to_dpu_block)} entries)"
                 )
+                # Also sync with manager on refresh
+                self._sync_prefix_map_with_manager()
         except Exception as e:
             logger.warning(f"[CacheFlow] Failed to refresh prefix map: {e}")
 
@@ -488,6 +534,12 @@ class CacheFlowConnectorV1(KVConnectorBase_V1):
             with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(self._hash_to_dpu_block, f)
             os.replace(tmp_path, self._prefix_map_path)
+            # Log what we persisted
+            sample_hashes = list(self._hash_to_dpu_block.keys())[:3]
+            logger.info(
+                f"[CacheFlow] Persisted prefix map with {len(self._hash_to_dpu_block)} entries. "
+                f"Sample: {[h[:8] + '...' for h in sample_hashes]}"
+            )
         except Exception as e:
             logger.warning(f"[CacheFlow] Failed to persist prefix map: {e}")
 
@@ -635,6 +687,12 @@ class CacheFlowConnectorV1(KVConnectorBase_V1):
 
             prefix_hash = compute_prefix_hash(token_ids, cached_tokens)
 
+            logger.info(
+                f"[CacheFlow] get_num_new_matched_tokens for {req_id}: "
+                f"prompt_len={len(token_ids)}, hash_tokens={cached_tokens}, "
+                f"hash={prefix_hash[:8]}..., num_computed_tokens={num_computed_tokens}"
+            )
+
             # Create/update tracker for requests
             if req_id not in self._request_trackers:
                 self._request_trackers[req_id] = RequestTracker(
@@ -652,7 +710,16 @@ class CacheFlowConnectorV1(KVConnectorBase_V1):
 
             tracker = self._request_trackers[req_id]
             dpu_block_id = self._hash_to_dpu_block.get(prefix_hash)
-            
+
+            # Debug: show prefix map state
+            if not self._hash_to_dpu_block:
+                logger.warning(f"[CacheFlow] Prefix map is EMPTY for {req_id}")
+            else:
+                logger.info(
+                    f"[CacheFlow] Prefix map has {len(self._hash_to_dpu_block)} entries, "
+                    f"lookup result: dpu_block_id={dpu_block_id}"
+                )
+
             if dpu_block_id is not None:
                 self._record_prefix_use(prefix_hash)
 
@@ -1355,10 +1422,27 @@ class CacheFlowConnectorV1(KVConnectorBase_V1):
         if self._manager is None:
             return None
 
-        # Compute prefix hash
+        # CRITICAL: Compute prefix hash using the SAME token count as the load path.
+        # The load path uses common_prefix_num_tokens (or full prompt if not set).
+        # We must match this exactly, even if we save fewer tokens due to block limits.
+        # Otherwise, the hash won't match and we'll never get cache hits!
+        hash_token_count = (
+            len(save_spec.token_ids)
+            if self._offload_full_prompt
+            else (self.common_prefix_num_tokens or len(save_spec.token_ids))
+        )
+        # Cap at actual token count to avoid hashing beyond available data
+        hash_token_count = min(hash_token_count, len(save_spec.token_ids))
+
         prefix_hash = compute_prefix_hash(
             save_spec.token_ids,
-            batch.cached_tokens,
+            hash_token_count,
+        )
+
+        logger.info(
+            f"[CacheFlow] Computed save hash for {req_id}: "
+            f"hash_token_count={hash_token_count}, actual_saved_tokens={batch.cached_tokens}, "
+            f"hash={prefix_hash[:8]}..."
         )
 
         # Check if prefix already cached
@@ -1462,11 +1546,15 @@ class CacheFlowConnectorV1(KVConnectorBase_V1):
 
             try:
                 # Early skip check for already-cached prefixes
+                # Use the SAME hash computation as get_num_new_matched_tokens() for consistency
                 expected_cached_tokens = (
                     len(save_spec.token_ids)
                     if self._offload_full_prompt
                     else (self.common_prefix_num_tokens or len(save_spec.token_ids))
                 )
+                # Cap at actual token count to avoid hashing beyond available data
+                expected_cached_tokens = min(expected_cached_tokens, len(save_spec.token_ids))
+
                 if expected_cached_tokens > 0 and self._skip_save_if_prefix_cached:
                     prefix_hash = compute_prefix_hash(
                         save_spec.token_ids,

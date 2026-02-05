@@ -52,6 +52,37 @@ static void signal_handler(int signum) {
     }
 }
 
+/* Backpressure: Wait for DMA queue space before submitting new tasks.
+ * This prevents DOCA_ERROR_BAD_STATE when queue is full. */
+#define DMA_QUEUE_HEADROOM 32  /* Leave some slots free for safety */
+#define BACKPRESSURE_MAX_WAIT_MS 1000  /* Max time to wait for queue space */
+
+static doca_error_t wait_for_dma_queue_space(dpu_offloader_t *off) {
+    uint32_t wait_count = 0;
+    const uint32_t max_iterations = BACKPRESSURE_MAX_WAIT_MS;  /* 1ms per iteration */
+
+    while (off->dma_tasks_in_flight >= off->dma_queue_high_watermark) {
+        /* Process completions to free up queue slots */
+        doca_pe_progress(off->pe);
+
+        if (wait_count++ > max_iterations) {
+            DOCA_LOG_ERR("Backpressure timeout: %u tasks still in flight after %u ms",
+                         off->dma_tasks_in_flight, BACKPRESSURE_MAX_WAIT_MS);
+            return DOCA_ERROR_TIME_OUT;
+        }
+
+        /* Brief sleep to avoid busy-spinning */
+        usleep(1000);  /* 1ms */
+
+        if (wait_count % 100 == 0) {
+            DOCA_LOG_DBG("Backpressure: waiting for queue space, %u tasks in flight",
+                         off->dma_tasks_in_flight);
+        }
+    }
+
+    return DOCA_SUCCESS;
+}
+
 /* Helper to destroy a single buffer safely */
 static void destroy_dpu_buffer(dpu_buffer_t *buf) {
     if (!buf) return;
@@ -152,6 +183,11 @@ static void dma_completed_callback(struct doca_dma_task_memcpy *task, union doca
     offload_ctx_t *ctx = (offload_ctx_t *)task_user_data.ptr;
     (void)ctx_user_data;
 
+    /* Decrement in-flight counter (backpressure) */
+    if (ctx->off->dma_tasks_in_flight > 0) {
+        __sync_fetch_and_sub(&ctx->off->dma_tasks_in_flight, 1);
+    }
+
     /* Release buffers */
     doca_buf_dec_refcount(ctx->src_buf, NULL);
     doca_buf_dec_refcount(ctx->dst_buf, NULL);
@@ -217,6 +253,11 @@ static void dma_error_callback(struct doca_dma_task_memcpy *task, union doca_dat
     struct doca_task *doca_task = doca_dma_task_memcpy_as_task(task);
     doca_error_t error_result;
     (void)ctx_user_data;
+
+    /* Decrement in-flight counter (backpressure) */
+    if (ctx->off->dma_tasks_in_flight > 0) {
+        __sync_fetch_and_sub(&ctx->off->dma_tasks_in_flight, 1);
+    }
 
     error_result = doca_task_get_status(doca_task);
     DOCA_LOG_ERR("DMA transfer %lu failed: %s (%d)", ctx->transfer_id, doca_error_get_descr(error_result), error_result);
@@ -386,7 +427,7 @@ static doca_error_t handle_buffer_registration(dpu_offloader_t *off, buffer_regi
 #define DMA_TASK_ALLOC_MAX_RETRIES 10
 #define DMA_TASK_ALLOC_RETRY_DELAY_US 1000  /* 1ms between retries */
 
-/* Submit a single DMA chunk with retry logic for queue-full conditions */
+/* Submit a single DMA chunk with backpressure and retry logic */
 static doca_error_t submit_dma_chunk(dpu_offloader_t *off, dpu_buffer_t *buf,
                                       uint64_t offset, size_t length,
                                       uint64_t transfer_id, struct doca_comch_connection *connection,
@@ -400,6 +441,13 @@ static doca_error_t submit_dma_chunk(dpu_offloader_t *off, dpu_buffer_t *buf,
 
     void *src_addr = (void *)(buf->host_addr + offset);
     void *dst_addr = (void *)((uint64_t)buf->local_addr + offset);
+
+    /* Backpressure: wait for queue space before attempting allocation */
+    result = wait_for_dma_queue_space(off);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("Backpressure timeout waiting for DMA queue space");
+        return result;
+    }
 
     /* Create source buffer */
     result = doca_buf_inventory_buf_get_by_addr(off->buf_inventory, buf->remote_mmap,
@@ -503,6 +551,9 @@ static doca_error_t submit_dma_chunk(dpu_offloader_t *off, dpu_buffer_t *buf,
         return result;
     }
 
+    /* Increment in-flight counter after successful submit */
+    __sync_fetch_and_add(&off->dma_tasks_in_flight, 1);
+
     return DOCA_SUCCESS;
 }
 
@@ -587,7 +638,7 @@ static doca_error_t handle_transfer_request(dpu_offloader_t *off, transfer_reque
     return DOCA_SUCCESS;
 }
 
-/* Submit a single DMA load chunk (DPU -> Host, reverse direction) with retry logic */
+/* Submit a single DMA load chunk (DPU -> Host, reverse direction) with backpressure */
 static doca_error_t submit_dma_load_chunk(dpu_offloader_t *off, dpu_buffer_t *buf,
                                           uint64_t offset, size_t length,
                                           uint64_t transfer_id, struct doca_comch_connection *connection,
@@ -602,6 +653,13 @@ static doca_error_t submit_dma_load_chunk(dpu_offloader_t *off, dpu_buffer_t *bu
     /* REVERSED: Source is DPU local memory, Destination is Host remote memory */
     void *src_addr = (void *)((uint64_t)buf->local_addr + offset);  /* DPU local */
     void *dst_addr = (void *)(buf->host_addr + offset);              /* Host remote */
+
+    /* Backpressure: wait for queue space before attempting allocation */
+    result = wait_for_dma_queue_space(off);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("LOAD: Backpressure timeout waiting for DMA queue space");
+        return result;
+    }
 
     /* Create source buffer from LOCAL mmap (DPU memory) */
     result = doca_buf_inventory_buf_get_by_addr(off->buf_inventory, buf->local_mmap,
@@ -698,6 +756,9 @@ static doca_error_t submit_dma_load_chunk(dpu_offloader_t *off, dpu_buffer_t *bu
         free(ctx);
         return result;
     }
+
+    /* Increment in-flight counter after successful submit */
+    __sync_fetch_and_add(&off->dma_tasks_in_flight, 1);
 
     DOCA_LOG_DBG("LOAD: Submitted DMA chunk: DPU %p -> Host %p, %zu bytes", src_addr, dst_addr, length);
     return DOCA_SUCCESS;
@@ -930,6 +991,11 @@ doca_error_t dpu_offloader_init(dpu_offloader_t **offloader, const char *server_
         free(off);
         return result;
     }
+
+    /* Initialize backpressure: track in-flight tasks and set high watermark */
+    off->dma_tasks_in_flight = 0;
+    off->dma_queue_high_watermark = MAX_QUEUE_DEPTH - DMA_QUEUE_HEADROOM;
+    DOCA_LOG_INFO("DMA queue depth: %d, high watermark: %u", MAX_QUEUE_DEPTH, off->dma_queue_high_watermark);
 
     result = doca_ctx_start(ctx);
     if (result != DOCA_SUCCESS) {

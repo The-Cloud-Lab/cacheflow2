@@ -56,6 +56,10 @@ struct dpu_offloader {
     // DMA capabilities
     uint64_t max_dma_buf_size;  // Maximum buffer size per DMA operation
 
+    // DMA queue management (backpressure)
+    volatile uint32_t dma_tasks_in_flight;  // Current number of submitted DMA tasks
+    uint32_t dma_queue_high_watermark;      // Threshold to start backpressure
+
     // Statistics
     transfer_stats_t stats;
 

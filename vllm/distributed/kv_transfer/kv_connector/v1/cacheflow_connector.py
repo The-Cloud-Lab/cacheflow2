@@ -197,6 +197,7 @@ class DOCABackendLoader:
         async_transfers: bool,
         copy_stream_pool_size: int = 4,
         overlap_dma: bool = True,
+        max_staging_buffers: int = None,
     ):
         """Get or create the KVOffloadManager singleton."""
         with cls._lock:
@@ -216,6 +217,7 @@ class DOCABackendLoader:
                     block_size=block_size,
                     max_blocks=max_blocks,
                     num_staging_buffers=num_staging_buffers,
+                    max_staging_buffers=max_staging_buffers,
                     async_transfers=async_transfers,
                     copy_stream_pool_size=copy_stream_pool_size,
                     overlap_dma=overlap_dma,
@@ -274,6 +276,7 @@ class CacheFlowConnectorV1(KVConnectorBase_V1):
         self.block_size = extra_config.get('block_size', 64 * 1024 * 1024)  # 64MB
         self.max_blocks = extra_config.get('max_blocks', 256)
         self.num_staging_buffers = extra_config.get('num_staging_buffers', 16)
+        self.max_staging_buffers = extra_config.get('max_staging_buffers', None)  # None = 8x num
         self.async_transfers = extra_config.get('async_transfers', True)
         self.copy_stream_pool_size = extra_config.get('copy_stream_pool_size', 4)
         self.overlap_dma = extra_config.get('overlap_dma_with_copy', True)
@@ -324,6 +327,7 @@ class CacheFlowConnectorV1(KVConnectorBase_V1):
                 block_size=self.block_size,
                 max_blocks=self.max_blocks,
                 num_staging_buffers=self.num_staging_buffers,
+                max_staging_buffers=self.max_staging_buffers,
                 async_transfers=self.async_transfers,
                 copy_stream_pool_size=self.copy_stream_pool_size,
                 overlap_dma=self.overlap_dma,
@@ -1403,6 +1407,16 @@ class CacheFlowConnectorV1(KVConnectorBase_V1):
 
         # Extract KV data and write directly to combined buffer slice
         kv_data = self._extract_kv_from_layer(kv_layer, slot_mapping, attn_metadata)
+
+        # Validate size matches pre-allocated buffer to avoid tensor mismatch errors
+        actual_numel = kv_data.numel()
+        if actual_numel != numel:
+            logger.warning(
+                f"[CacheFlow] Size mismatch for layer {layer_name}: "
+                f"expected {numel}, got {actual_numel}. Skipping layer."
+            )
+            return False
+
         batch.combined[offset:offset + numel] = kv_data.reshape(-1)
         batch.layers_written.add(layer_name)
 

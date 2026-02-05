@@ -10,7 +10,7 @@
         "tokens_per_block": 256,
         "block_size": 536870912,
         "max_blocks": 20,
-        "common_prefix_num_tokens": 14999,
+        "common_prefix_num_tokens": 1000,
         "num_staging_buffers": 4,
         "async_transfers": true,
         "copy_stream_pool_size": 4,

@@ -382,7 +382,11 @@ static doca_error_t handle_buffer_registration(dpu_offloader_t *off, buffer_regi
     return DOCA_SUCCESS;
 }
 
-/* Submit a single DMA chunk */
+/* Maximum retries for DMA task allocation when queue is full */
+#define DMA_TASK_ALLOC_MAX_RETRIES 10
+#define DMA_TASK_ALLOC_RETRY_DELAY_US 1000  /* 1ms between retries */
+
+/* Submit a single DMA chunk with retry logic for queue-full conditions */
 static doca_error_t submit_dma_chunk(dpu_offloader_t *off, dpu_buffer_t *buf,
                                       uint64_t offset, size_t length,
                                       uint64_t transfer_id, struct doca_comch_connection *connection,
@@ -392,6 +396,7 @@ static doca_error_t submit_dma_chunk(dpu_offloader_t *off, dpu_buffer_t *buf,
     struct doca_dma_task_memcpy *task = NULL;
     offload_ctx_t *ctx = NULL;
     union doca_data user_data;
+    int retry_count = 0;
 
     void *src_addr = (void *)(buf->host_addr + offset);
     void *dst_addr = (void *)((uint64_t)buf->local_addr + offset);
@@ -434,19 +439,63 @@ static doca_error_t submit_dma_chunk(dpu_offloader_t *off, dpu_buffer_t *buf,
     ctx->chunk_tracker = tracker;
     user_data.ptr = ctx;
 
-    /* Allocate and submit DMA task */
-    result = doca_dma_task_memcpy_alloc_init(off->dma, src_buf, dst_buf, user_data, &task);
+    /* Allocate DMA task with retry logic for queue-full (Bad State) conditions.
+     * When the task queue is full, we need to process completions to free slots. */
+    while (retry_count < DMA_TASK_ALLOC_MAX_RETRIES) {
+        result = doca_dma_task_memcpy_alloc_init(off->dma, src_buf, dst_buf, user_data, &task);
+        if (result == DOCA_SUCCESS) {
+            break;  /* Task allocated successfully */
+        }
+
+        /* If allocation failed, process pending completions to free task slots */
+        if (result == DOCA_ERROR_BAD_STATE || result == DOCA_ERROR_NO_MEMORY) {
+            retry_count++;
+            if (retry_count < DMA_TASK_ALLOC_MAX_RETRIES) {
+                /* Process completions to free up task slots */
+                doca_pe_progress(off->pe);
+                usleep(DMA_TASK_ALLOC_RETRY_DELAY_US);
+                DOCA_LOG_DBG("DMA task alloc retry %d/%d after processing completions",
+                             retry_count, DMA_TASK_ALLOC_MAX_RETRIES);
+            }
+        } else {
+            /* Non-recoverable error, don't retry */
+            break;
+        }
+    }
+
     if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Failed to allocate DMA task: %s", doca_error_get_descr(result));
+        DOCA_LOG_ERR("Failed to allocate DMA task after %d retries: %s",
+                     retry_count, doca_error_get_descr(result));
         doca_buf_dec_refcount(src_buf, NULL);
         doca_buf_dec_refcount(dst_buf, NULL);
         free(ctx);
         return result;
     }
 
-    result = doca_task_submit(doca_dma_task_memcpy_as_task(task));
+    /* Submit the task with similar retry logic */
+    retry_count = 0;
+    while (retry_count < DMA_TASK_ALLOC_MAX_RETRIES) {
+        result = doca_task_submit(doca_dma_task_memcpy_as_task(task));
+        if (result == DOCA_SUCCESS) {
+            break;
+        }
+
+        if (result == DOCA_ERROR_BAD_STATE || result == DOCA_ERROR_NO_MEMORY) {
+            retry_count++;
+            if (retry_count < DMA_TASK_ALLOC_MAX_RETRIES) {
+                doca_pe_progress(off->pe);
+                usleep(DMA_TASK_ALLOC_RETRY_DELAY_US);
+                DOCA_LOG_DBG("DMA task submit retry %d/%d after processing completions",
+                             retry_count, DMA_TASK_ALLOC_MAX_RETRIES);
+            }
+        } else {
+            break;
+        }
+    }
+
     if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Failed to submit DMA task: %s", doca_error_get_descr(result));
+        DOCA_LOG_ERR("Failed to submit DMA task after %d retries: %s",
+                     retry_count, doca_error_get_descr(result));
         doca_task_free(doca_dma_task_memcpy_as_task(task));
         doca_buf_dec_refcount(src_buf, NULL);
         doca_buf_dec_refcount(dst_buf, NULL);
@@ -538,7 +587,7 @@ static doca_error_t handle_transfer_request(dpu_offloader_t *off, transfer_reque
     return DOCA_SUCCESS;
 }
 
-/* Submit a single DMA load chunk (DPU -> Host, reverse direction) */
+/* Submit a single DMA load chunk (DPU -> Host, reverse direction) with retry logic */
 static doca_error_t submit_dma_load_chunk(dpu_offloader_t *off, dpu_buffer_t *buf,
                                           uint64_t offset, size_t length,
                                           uint64_t transfer_id, struct doca_comch_connection *connection,
@@ -548,6 +597,7 @@ static doca_error_t submit_dma_load_chunk(dpu_offloader_t *off, dpu_buffer_t *bu
     struct doca_dma_task_memcpy *task = NULL;
     offload_ctx_t *ctx = NULL;
     union doca_data user_data;
+    int retry_count = 0;
 
     /* REVERSED: Source is DPU local memory, Destination is Host remote memory */
     void *src_addr = (void *)((uint64_t)buf->local_addr + offset);  /* DPU local */
@@ -591,19 +641,57 @@ static doca_error_t submit_dma_load_chunk(dpu_offloader_t *off, dpu_buffer_t *bu
     ctx->chunk_tracker = tracker;
     user_data.ptr = ctx;
 
-    /* Allocate and submit DMA task (DPU local -> Host remote) */
-    result = doca_dma_task_memcpy_alloc_init(off->dma, src_buf, dst_buf, user_data, &task);
+    /* Allocate DMA task with retry logic for queue-full conditions */
+    while (retry_count < DMA_TASK_ALLOC_MAX_RETRIES) {
+        result = doca_dma_task_memcpy_alloc_init(off->dma, src_buf, dst_buf, user_data, &task);
+        if (result == DOCA_SUCCESS) {
+            break;
+        }
+
+        if (result == DOCA_ERROR_BAD_STATE || result == DOCA_ERROR_NO_MEMORY) {
+            retry_count++;
+            if (retry_count < DMA_TASK_ALLOC_MAX_RETRIES) {
+                doca_pe_progress(off->pe);
+                usleep(DMA_TASK_ALLOC_RETRY_DELAY_US);
+                DOCA_LOG_DBG("LOAD: DMA task alloc retry %d/%d", retry_count, DMA_TASK_ALLOC_MAX_RETRIES);
+            }
+        } else {
+            break;
+        }
+    }
+
     if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("LOAD: Failed to allocate DMA task: %s", doca_error_get_descr(result));
+        DOCA_LOG_ERR("LOAD: Failed to allocate DMA task after %d retries: %s",
+                     retry_count, doca_error_get_descr(result));
         doca_buf_dec_refcount(src_buf, NULL);
         doca_buf_dec_refcount(dst_buf, NULL);
         free(ctx);
         return result;
     }
 
-    result = doca_task_submit(doca_dma_task_memcpy_as_task(task));
+    /* Submit task with retry logic */
+    retry_count = 0;
+    while (retry_count < DMA_TASK_ALLOC_MAX_RETRIES) {
+        result = doca_task_submit(doca_dma_task_memcpy_as_task(task));
+        if (result == DOCA_SUCCESS) {
+            break;
+        }
+
+        if (result == DOCA_ERROR_BAD_STATE || result == DOCA_ERROR_NO_MEMORY) {
+            retry_count++;
+            if (retry_count < DMA_TASK_ALLOC_MAX_RETRIES) {
+                doca_pe_progress(off->pe);
+                usleep(DMA_TASK_ALLOC_RETRY_DELAY_US);
+                DOCA_LOG_DBG("LOAD: DMA task submit retry %d/%d", retry_count, DMA_TASK_ALLOC_MAX_RETRIES);
+            }
+        } else {
+            break;
+        }
+    }
+
     if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("LOAD: Failed to submit DMA task: %s", doca_error_get_descr(result));
+        DOCA_LOG_ERR("LOAD: Failed to submit DMA task after %d retries: %s",
+                     retry_count, doca_error_get_descr(result));
         doca_task_free(doca_dma_task_memcpy_as_task(task));
         doca_buf_dec_refcount(src_buf, NULL);
         doca_buf_dec_refcount(dst_buf, NULL);

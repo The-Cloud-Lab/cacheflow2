@@ -408,18 +408,29 @@ class PinnedBufferPool:
     Pool of pinned buffers for efficient reuse.
 
     Instead of allocating/freeing pinned memory for each transfer,
-    this pool maintains a set of reusable buffers.
+    this pool maintains a set of reusable buffers. The pool can grow
+    dynamically under load but will shrink back when buffers are released
+    and the pool exceeds max_buffers threshold.
     """
 
-    def __init__(self, buffer_size: int, num_buffers: int = 4):
+    def __init__(self, buffer_size: int, num_buffers: int = 4, max_buffers: int = None):
         """
         Create a buffer pool.
 
         Args:
             buffer_size: Size of each buffer
             num_buffers: Number of buffers to pre-allocate
+            max_buffers: Maximum buffers to keep in pool (default: 2x num_buffers).
+                         Buffers beyond this are freed on release to prevent OOM.
         """
         self.buffer_size = buffer_size
+        self.num_buffers = num_buffers
+        # Default max to 8x initial size - allows significant burst growth while
+        # still preventing unbounded OOM. With 4 initial buffers @ 512MB = 2GB,
+        # max becomes 32 buffers = 16GB cap. Shrinking only happens when truly idle.
+        self.max_buffers = max_buffers if max_buffers is not None else num_buffers * 8
+        self._total_allocated = num_buffers
+        self._total_freed = 0
         self._lock = threading.Lock()
         self._available: List[PinnedBuffer] = []
         self._in_use: Dict[int, PinnedBuffer] = {}
@@ -447,11 +458,19 @@ class PinnedBufferPool:
             return buf
 
     def release(self, buf: PinnedBuffer) -> None:
-        """Return a buffer to the pool."""
+        """Return a buffer to the pool, freeing if significantly over threshold."""
         with self._lock:
             if buf.ptr in self._in_use:
                 del self._in_use[buf.ptr]
-                self._available.append(buf)
+
+                # Only shrink when we have WAY more buffers than needed.
+                # This prevents churn from constant alloc/free cycles.
+                # Free when: available > max_buffers AND nothing in use (system is idle)
+                if len(self._available) >= self.max_buffers and len(self._in_use) == 0:
+                    buf.free()  # Actually release memory back to system
+                    self._total_freed += 1
+                else:
+                    self._available.append(buf)
 
     def close(self) -> None:
         """Free all buffers in the pool."""

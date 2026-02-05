@@ -119,6 +119,7 @@ class KVOffloadManager:
         block_size: int = 64 * 1024 * 1024,  # 64MB default block size
         max_blocks: int = 256,
         num_staging_buffers: int = 16,  # Increased from 4
+        max_staging_buffers: int = None,  # Max buffers before shrinking (None = 8x num)
         async_transfers: bool = True,
         copy_stream_pool_size: int = 4,  # NEW: pool size for async copies
         overlap_dma: bool = True,  # NEW: overlap GPU->Host with Host->DPU
@@ -130,9 +131,12 @@ class KVOffloadManager:
             pci_addr: PCI address of BlueField DPU (auto-detect if None)
             block_size: Size of each KV block in bytes
             max_blocks: Maximum number of blocks to manage
-            num_staging_buffers: Number of pinned buffers for staging
+            num_staging_buffers: Number of pinned buffers for staging (pre-allocated)
+            max_staging_buffers: Max buffers to keep in pool before freeing (default: 8x num).
+                                 Higher values reduce buffer churn but use more memory.
             async_transfers: Enable async transfer mode
         """
+        self._max_staging_buffers = max_staging_buffers
         self.block_size = block_size
         self.max_blocks = max_blocks
         self.async_transfers = async_transfers
@@ -150,7 +154,9 @@ class KVOffloadManager:
         self._doca_client = DOCAKVOffloadClient(pci_addr)
 
         # Buffer pool for GPU <-> Host staging
-        self._buffer_pool = PinnedBufferPool(block_size, num_staging_buffers)
+        self._buffer_pool = PinnedBufferPool(
+            block_size, num_staging_buffers, max_buffers=self._max_staging_buffers
+        )
 
         # Block tracking
         self._blocks: Dict[int, BlockInfo] = {}
@@ -264,6 +270,14 @@ class KVOffloadManager:
             hash_key: Optional hash for prefix matching
             sync: Wait for transfer completion
         """
+        # Validate size before attempting transfer
+        if size > self.block_size:
+            raise ValueError(
+                f"Transfer size ({size} bytes) exceeds configured block_size "
+                f"({self.block_size} bytes). Increase block_size in config or "
+                f"reduce tokens_per_block/common_prefix_num_tokens."
+            )
+
         with self._lock:
             block = self._get_or_create_block(block_id, size)
 
@@ -287,9 +301,11 @@ class KVOffloadManager:
                 CUDARuntime.stream_synchronize(self._cuda_stream)
 
             # Register with DOCA if not already
+            # IMPORTANT: Register with full buffer capacity (self.block_size), not just
+            # the current transfer size. This allows buffer reuse for larger transfers.
             if block.buffer_id is None:
                 block.buffer_id = self._doca_client.register_buffer(
-                    pinned_buf.address, size
+                    pinned_buf.address, self.block_size
                 )
 
             # Transfer Host -> DPU
@@ -494,8 +510,34 @@ class KVOffloadManager:
 
         size = tensor.numel() * tensor.element_size()
 
+        # Validate size before attempting transfer
+        if size > self.block_size:
+            raise ValueError(
+                f"Transfer size ({size} bytes) exceeds configured block_size "
+                f"({self.block_size} bytes). Increase block_size in config or "
+                f"reduce tokens_per_block/common_prefix_num_tokens."
+            )
+
         with self._lock:
             block = self._get_or_create_block(block_id, size)
+
+            # If block is being reused, we MUST reset its buffer state.
+            # The old buffer_id was registered with DOCA pointing to the old
+            # pinned buffer address. If we reuse buffer_id with a new buffer,
+            # DOCA will transfer from/to the wrong address causing crashes.
+            if block.pinned_buffer is not None:
+                # Release old pinned buffer back to pool
+                self._buffer_pool.release(block.pinned_buffer)
+                block.pinned_buffer = None
+
+            if block.buffer_id is not None:
+                # Unregister old buffer from DOCA so we register the new one
+                try:
+                    self._doca_client.unregister_buffer(block.buffer_id)
+                except Exception as e:
+                    logger.warning(f"Error unregistering old buffer for block {block_id}: {e}")
+                block.buffer_id = None
+
             block.state = BlockState.TRANSFERRING_TO_DPU
 
             # Acquire stream/event from pool
@@ -544,9 +586,11 @@ class KVOffloadManager:
     ) -> None:
         """Start DOCA DMA transfer for a handle."""
         # Register buffer with DOCA if not already done
+        # IMPORTANT: Register with full buffer capacity (self.block_size), not just
+        # the current transfer size. This allows buffer reuse for larger transfers.
         if block.buffer_id is None:
             block.buffer_id = self._doca_client.register_buffer(
-                handle.pinned_buffer.address, size
+                handle.pinned_buffer.address, self.block_size
             )
 
         # Start Host->DPU transfer (async DOCA)
@@ -743,10 +787,63 @@ class KVOffloadManager:
             return self._hash_to_block.get(hash_key)
 
     def has_block(self, block_id: int) -> bool:
-        """Check if a block exists and is on DPU."""
+        """Check if a block exists and is on DPU with valid pinned buffer."""
         with self._lock:
             block = self._blocks.get(block_id)
-            return block is not None and block.state == BlockState.ON_DPU
+            # Block must be ON_DPU AND have a pinned buffer for actual loads.
+            # External blocks registered from prefix maps don't have pinned buffers
+            # and should not be considered "present" for loading purposes.
+            return (block is not None and
+                    block.state == BlockState.ON_DPU and
+                    block.pinned_buffer is not None)
+
+    def register_external_block(self, block_id: int, hash_key: str) -> bool:
+        """
+        Register an external block (e.g., from a previous session's prefix map).
+
+        This creates a block entry in ON_DPU state without actually transferring
+        data. Used to restore state from a persisted prefix map.
+
+        Args:
+            block_id: Block ID to register
+            hash_key: Hash key for prefix matching
+
+        Returns:
+            True if registered successfully, False if block already exists
+        """
+        with self._lock:
+            if block_id in self._blocks:
+                return False
+
+            # Create block entry in ON_DPU state (assumed already on DPU)
+            self._blocks[block_id] = BlockInfo(
+                block_id=block_id,
+                size=0,  # Unknown size from external source
+                state=BlockState.ON_DPU,
+                hash_key=hash_key,
+                last_access=time.time()
+            )
+            self._hash_to_block[hash_key] = block_id
+            self._update_lru(block_id)
+            return True
+
+    def register_external_blocks_from_map(
+        self, hash_to_block: Dict[str, int]
+    ) -> int:
+        """
+        Register multiple external blocks from a prefix map.
+
+        Args:
+            hash_to_block: Dict mapping hash keys to block IDs
+
+        Returns:
+            Number of blocks successfully registered
+        """
+        count = 0
+        for hash_key, block_id in hash_to_block.items():
+            if self.register_external_block(block_id, hash_key):
+                count += 1
+        return count
 
     def has_prefix(self, hash_key: str) -> bool:
         """Check if a prefix is cached on the DPU."""

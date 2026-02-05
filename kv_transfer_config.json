@@ -15,6 +15,8 @@
         "async_transfers": true,
         "copy_stream_pool_size": 4,
         "overlap_dma_with_copy": true,
+        "use_doca_buffer_pool": true, 
+        "num_staging_buffers": 16, 
         "load_prefix_map": true,
         "prefix_map_path": "/tmp/cacheflow_prefix_map.json"
     }

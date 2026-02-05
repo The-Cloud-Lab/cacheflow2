@@ -543,6 +543,172 @@ class CUDAEvent:
         self.destroy()
 
 
+class DOCABufferPool:
+    """
+    Pool of pinned buffers paired with pre-registered DOCA buffer IDs.
+
+    This eliminates the expensive register/unregister cycle on every transfer.
+    Each pinned buffer is registered with DOCA once at pool creation, and the
+    (pinned_buffer, buffer_id) pair is reused for all subsequent transfers.
+
+    Performance impact: Eliminates ~40-100ms registration overhead per transfer.
+    """
+
+    def __init__(self, doca_client, buffer_size: int, num_buffers: int = 16):
+        """
+        Create a DOCA buffer pool with pre-registered buffers.
+
+        Args:
+            doca_client: The DOCA client instance for registering buffers
+            buffer_size: Size of each buffer (should match block_size)
+            num_buffers: Number of buffer pairs to pre-allocate
+        """
+        self.buffer_size = buffer_size
+        self.num_buffers = num_buffers
+        self._doca_client = doca_client
+        self._lock = threading.Lock()
+        self._available: List[Tuple[PinnedBuffer, int]] = []  # (pinned_buf, buffer_id)
+        self._in_use: Dict[int, Tuple[PinnedBuffer, int]] = {}  # ptr -> (pinned_buf, buffer_id)
+        self._closed = False
+
+        # Pre-allocate pinned buffers AND register them with DOCA
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.info(f"DOCABufferPool: Pre-allocating {num_buffers} buffers of {buffer_size} bytes")
+
+        for i in range(num_buffers):
+            try:
+                # Allocate pinned buffer
+                pinned = PinnedBuffer(buffer_size)
+
+                # Register with DOCA (expensive operation - only done once!)
+                buffer_id = doca_client.register_buffer(pinned.address, buffer_size)
+
+                self._available.append((pinned, buffer_id))
+                logger.debug(f"DOCABufferPool: Pre-registered buffer {i+1}/{num_buffers}, "
+                           f"ptr=0x{pinned.address:x}, buffer_id={buffer_id}")
+            except Exception as e:
+                logger.error(f"DOCABufferPool: Failed to pre-allocate buffer {i+1}: {e}")
+                # Clean up already allocated buffers
+                self._cleanup_on_error()
+                raise
+
+        logger.info(f"DOCABufferPool: Successfully pre-registered {len(self._available)} buffers")
+
+    def _cleanup_on_error(self):
+        """Clean up buffers on initialization error."""
+        for pinned, buffer_id in self._available:
+            try:
+                self._doca_client.unregister_buffer(buffer_id)
+            except Exception:
+                pass
+            try:
+                pinned.free()
+            except Exception:
+                pass
+        self._available.clear()
+
+    def acquire(self) -> Tuple[PinnedBuffer, int]:
+        """
+        Acquire a (pinned_buffer, buffer_id) pair from the pool.
+
+        Returns:
+            Tuple of (PinnedBuffer, buffer_id) - already registered, no DOCA overhead!
+
+        Raises:
+            RuntimeError: If pool is exhausted (consider increasing num_buffers)
+        """
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("DOCABufferPool has been closed")
+
+            if not self._available:
+                # Pool exhausted - this shouldn't happen in steady state
+                # We could dynamically grow, but that defeats the purpose
+                import logging
+                logger = logging.getLogger(__name__)
+                logger.warning(f"DOCABufferPool exhausted! {len(self._in_use)} buffers in use. "
+                             "Consider increasing num_buffers.")
+
+                # Dynamically allocate (slower path, but prevents failure)
+                pinned = PinnedBuffer(self.buffer_size)
+                buffer_id = self._doca_client.register_buffer(pinned.address, self.buffer_size)
+                logger.warning(f"DOCABufferPool: Dynamic allocation - ptr=0x{pinned.address:x}, "
+                             f"buffer_id={buffer_id}")
+            else:
+                pinned, buffer_id = self._available.pop()
+
+            self._in_use[pinned.ptr] = (pinned, buffer_id)
+            return pinned, buffer_id
+
+    def release(self, pinned: PinnedBuffer, buffer_id: int) -> None:
+        """
+        Return a (pinned_buffer, buffer_id) pair to the pool.
+
+        NO unregistration happens - the buffer remains registered for reuse.
+
+        Args:
+            pinned: The PinnedBuffer to return
+            buffer_id: The DOCA buffer ID (must match the original pair)
+        """
+        with self._lock:
+            if self._closed:
+                return
+
+            if pinned.ptr in self._in_use:
+                del self._in_use[pinned.ptr]
+                self._available.append((pinned, buffer_id))
+
+    def close(self) -> None:
+        """
+        Close the pool and unregister all buffers from DOCA.
+
+        This is the ONLY time unregistration happens.
+        """
+        import logging
+        logger = logging.getLogger(__name__)
+
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+
+            # Unregister and free all buffers
+            all_buffers = list(self._available) + list(self._in_use.values())
+            logger.info(f"DOCABufferPool: Closing pool, unregistering {len(all_buffers)} buffers")
+
+            for pinned, buffer_id in all_buffers:
+                try:
+                    self._doca_client.unregister_buffer(buffer_id)
+                except Exception as e:
+                    logger.warning(f"DOCABufferPool: Failed to unregister buffer {buffer_id}: {e}")
+                try:
+                    pinned.free()
+                except Exception as e:
+                    logger.warning(f"DOCABufferPool: Failed to free pinned buffer: {e}")
+
+            self._available.clear()
+            self._in_use.clear()
+
+    @property
+    def stats(self) -> Dict[str, int]:
+        """Get pool statistics."""
+        with self._lock:
+            return {
+                "total": len(self._available) + len(self._in_use),
+                "available": len(self._available),
+                "in_use": len(self._in_use),
+                "buffer_size": self.buffer_size,
+            }
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+        return False
+
+
 class StreamEventPool:
     """
     Pool of CUDA streams and events for efficient async operations.

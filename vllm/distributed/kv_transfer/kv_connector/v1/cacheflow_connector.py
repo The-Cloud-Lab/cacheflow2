@@ -198,6 +198,7 @@ class DOCABackendLoader:
         copy_stream_pool_size: int = 4,
         overlap_dma: bool = True,
         max_staging_buffers: int = None,
+        use_doca_buffer_pool: bool = True,  # NEW: use pre-registered buffer pool
     ):
         """Get or create the KVOffloadManager singleton."""
         with cls._lock:
@@ -221,9 +222,10 @@ class DOCABackendLoader:
                     async_transfers=async_transfers,
                     copy_stream_pool_size=copy_stream_pool_size,
                     overlap_dma=overlap_dma,
+                    use_doca_buffer_pool=use_doca_buffer_pool,
                 )
                 cls._initialized = True
-                logger.info("DOCA KVOffloadManager initialized successfully")
+                logger.info(f"DOCA KVOffloadManager initialized (buffer_pool={use_doca_buffer_pool})")
                 return cls._manager
             except ImportError as e:
                 logger.error(f"Failed to import DOCA backend: {e}")
@@ -280,6 +282,8 @@ class CacheFlowConnectorV1(KVConnectorBase_V1):
         self.async_transfers = extra_config.get('async_transfers', True)
         self.copy_stream_pool_size = extra_config.get('copy_stream_pool_size', 4)
         self.overlap_dma = extra_config.get('overlap_dma_with_copy', True)
+        # NEW: Use pre-registered DOCA buffer pool (eliminates ~40-100ms overhead per transfer)
+        self.use_doca_buffer_pool = extra_config.get('use_doca_buffer_pool', True)
         self.tokens_per_block = extra_config.get('tokens_per_block', 1024)
         self._skip_save_if_prefix_cached = bool(
             extra_config.get("skip_save_if_prefix_cached", True)
@@ -331,6 +335,7 @@ class CacheFlowConnectorV1(KVConnectorBase_V1):
                 async_transfers=self.async_transfers,
                 copy_stream_pool_size=self.copy_stream_pool_size,
                 overlap_dma=self.overlap_dma,
+                use_doca_buffer_pool=self.use_doca_buffer_pool,
             )
 
         # Scheduler-side state

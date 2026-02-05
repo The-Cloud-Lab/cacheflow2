@@ -39,13 +39,13 @@ if TYPE_CHECKING:
 # Local imports
 try:
     from .doca_cuda_utils import (
-        PinnedBuffer, PinnedBufferPool, CUDARuntime,
+        PinnedBuffer, PinnedBufferPool, DOCABufferPool, CUDARuntime,
         CUDAEvent, StreamEventPool
     )
     from .doca_kv_offload import DOCAKVOffloadClient, find_bluefield_pci_address
 except ImportError:
     from doca_cuda_utils import (
-        PinnedBuffer, PinnedBufferPool, CUDARuntime,
+        PinnedBuffer, PinnedBufferPool, DOCABufferPool, CUDARuntime,
         CUDAEvent, StreamEventPool
     )
     from doca_kv_offload import DOCAKVOffloadClient, find_bluefield_pci_address
@@ -123,6 +123,7 @@ class KVOffloadManager:
         async_transfers: bool = True,
         copy_stream_pool_size: int = 4,  # NEW: pool size for async copies
         overlap_dma: bool = True,  # NEW: overlap GPU->Host with Host->DPU
+        use_doca_buffer_pool: bool = True,  # NEW: use pre-registered DOCA buffer pool
     ):
         """
         Initialize the KV offload manager.
@@ -135,11 +136,14 @@ class KVOffloadManager:
             max_staging_buffers: Max buffers to keep in pool before freeing (default: 8x num).
                                  Higher values reduce buffer churn but use more memory.
             async_transfers: Enable async transfer mode
+            use_doca_buffer_pool: Use pre-registered DOCA buffer pool (eliminates
+                                  register/unregister overhead - HIGHLY RECOMMENDED)
         """
         self._max_staging_buffers = max_staging_buffers
         self.block_size = block_size
         self.max_blocks = max_blocks
         self.async_transfers = async_transfers
+        self._use_doca_buffer_pool = use_doca_buffer_pool
 
         # Auto-detect DPU if not specified
         if pci_addr is None:
@@ -154,9 +158,21 @@ class KVOffloadManager:
         self._doca_client = DOCAKVOffloadClient(pci_addr)
 
         # Buffer pool for GPU <-> Host staging
-        self._buffer_pool = PinnedBufferPool(
-            block_size, num_staging_buffers, max_buffers=self._max_staging_buffers
-        )
+        # When use_doca_buffer_pool=True, use DOCABufferPool which pairs pinned buffers
+        # with pre-registered DOCA buffer IDs (eliminates ~40-100ms registration overhead)
+        if use_doca_buffer_pool:
+            logger.info("Using DOCABufferPool with pre-registered buffers (optimized)")
+            self._doca_buffer_pool = DOCABufferPool(
+                self._doca_client, block_size, num_staging_buffers
+            )
+            # Legacy pool not used but kept for compatibility
+            self._buffer_pool = None
+        else:
+            logger.info("Using legacy PinnedBufferPool (register per transfer)")
+            self._doca_buffer_pool = None
+            self._buffer_pool = PinnedBufferPool(
+                block_size, num_staging_buffers, max_buffers=self._max_staging_buffers
+            )
 
         # Block tracking
         self._blocks: Dict[int, BlockInfo] = {}
@@ -232,16 +248,21 @@ class KVOffloadManager:
 
         block = self._blocks[block_id]
 
-        # Unregister from DOCA if registered
-        if block.buffer_id is not None:
-            try:
-                self._doca_client.unregister_buffer(block.buffer_id)
-            except Exception as e:
-                logger.warning(f"Error unregistering buffer: {e}")
+        if self._use_doca_buffer_pool:
+            # With DOCABufferPool, release the (pinned_buffer, buffer_id) pair
+            # back to the pool - NO unregistration needed!
+            if block.pinned_buffer is not None and block.buffer_id is not None:
+                self._doca_buffer_pool.release(block.pinned_buffer, block.buffer_id)
+        else:
+            # Legacy path: unregister and release separately
+            if block.buffer_id is not None:
+                try:
+                    self._doca_client.unregister_buffer(block.buffer_id)
+                except Exception as e:
+                    logger.warning(f"Error unregistering buffer: {e}")
 
-        # Release pinned buffer if held
-        if block.pinned_buffer is not None:
-            self._buffer_pool.release(block.pinned_buffer)
+            if block.pinned_buffer is not None:
+                self._buffer_pool.release(block.pinned_buffer)
 
         # Remove from hash index
         if block.hash_key and block.hash_key in self._hash_to_block:
@@ -521,31 +542,40 @@ class KVOffloadManager:
         with self._lock:
             block = self._get_or_create_block(block_id, size)
 
-            # If block is being reused, we MUST reset its buffer state.
-            # The old buffer_id was registered with DOCA pointing to the old
-            # pinned buffer address. If we reuse buffer_id with a new buffer,
-            # DOCA will transfer from/to the wrong address causing crashes.
-            if block.pinned_buffer is not None:
-                # Release old pinned buffer back to pool
-                self._buffer_pool.release(block.pinned_buffer)
-                block.pinned_buffer = None
+            # Release any previous buffer resources for this block
+            if self._use_doca_buffer_pool:
+                # With DOCABufferPool, pinned_buffer and buffer_id are paired
+                # Release the pair back to pool if block had one
+                if block.pinned_buffer is not None and block.buffer_id is not None:
+                    self._doca_buffer_pool.release(block.pinned_buffer, block.buffer_id)
+                    block.pinned_buffer = None
+                    block.buffer_id = None
 
-            if block.buffer_id is not None:
-                # Unregister old buffer from DOCA so we register the new one
-                try:
-                    self._doca_client.unregister_buffer(block.buffer_id)
-                except Exception as e:
-                    logger.warning(f"Error unregistering old buffer for block {block_id}: {e}")
-                block.buffer_id = None
+                # Acquire new (pinned_buffer, buffer_id) pair - ALREADY REGISTERED!
+                # No DOCA registration overhead here - this is the key optimization
+                pinned_buf, buffer_id = self._doca_buffer_pool.acquire()
+                block.pinned_buffer = pinned_buf
+                block.buffer_id = buffer_id  # Pre-registered, no overhead!
+            else:
+                # Legacy path: separate buffer pool + manual DOCA registration
+                if block.pinned_buffer is not None:
+                    self._buffer_pool.release(block.pinned_buffer)
+                    block.pinned_buffer = None
+
+                if block.buffer_id is not None:
+                    try:
+                        self._doca_client.unregister_buffer(block.buffer_id)
+                    except Exception as e:
+                        logger.warning(f"Error unregistering old buffer for block {block_id}: {e}")
+                    block.buffer_id = None
+
+                pinned_buf = self._buffer_pool.acquire()
+                block.pinned_buffer = pinned_buf
 
             block.state = BlockState.TRANSFERRING_TO_DPU
 
             # Acquire stream/event from pool
             copy_stream, copy_event = self._stream_event_pool.acquire()
-
-            # Acquire staging buffer
-            pinned_buf = self._buffer_pool.acquire()
-            block.pinned_buffer = pinned_buf
 
             # Async GPU->Host copy (NO synchronization!)
             CUDARuntime.memcpy_dtoh(
@@ -585,10 +615,11 @@ class KVOffloadManager:
         hash_key: Optional[str]
     ) -> None:
         """Start DOCA DMA transfer for a handle."""
-        # Register buffer with DOCA if not already done
+        # Register buffer with DOCA if not already done (legacy path only)
+        # With DOCABufferPool, buffer_id is already set from acquire()
         # IMPORTANT: Register with full buffer capacity (self.block_size), not just
         # the current transfer size. This allows buffer reuse for larger transfers.
-        if block.buffer_id is None:
+        if block.buffer_id is None and not self._use_doca_buffer_pool:
             block.buffer_id = self._doca_client.register_buffer(
                 handle.pinned_buffer.address, self.block_size
             )
@@ -893,7 +924,7 @@ class KVOffloadManager:
         logger.info("Closing KVOffloadManager")
 
         with self._lock:
-            # Cleanup all blocks
+            # Cleanup all blocks (releases buffers back to pool)
             for block_id in list(self._blocks.keys()):
                 self._remove_block(block_id)
 
@@ -906,8 +937,11 @@ class KVOffloadManager:
         if hasattr(self, '_stream_event_pool'):
             self._stream_event_pool.close()
 
-        # Close buffer pool
-        self._buffer_pool.close()
+        # Close buffer pool (DOCABufferPool or legacy PinnedBufferPool)
+        if self._use_doca_buffer_pool and self._doca_buffer_pool is not None:
+            self._doca_buffer_pool.close()
+        elif self._buffer_pool is not None:
+            self._buffer_pool.close()
 
         # Close DOCA client
         self._doca_client.close()

@@ -1,0 +1,56 @@
+{
+  "name": "datapath",
+  "description": "Who drives the transfer (GPU-host NIC vs BlueField-3) and whether the GPU gathers directly into NIC-registered memory (zero-copy on GB10) or via copy engines.",
+  "model": "Qwen/Qwen3-4B",
+  "server_host": "10.0.1.2",
+  "port": 8100,
+  "vllm_args": [
+    "--max-model-len",
+    "32000",
+    "--gpu-memory-utilization",
+    "0.3"
+  ],
+  "workload": {
+    "prefix_len": 20000,
+    "suffix_len": 0,
+    "num_prefixes": 10,
+    "output_len": 100,
+    "num_prompts": 100,
+    "burstiness": 1.0,
+    "seed": 0
+  },
+  "request_rates": [
+    1,
+    4
+  ],
+  "variants": [
+    {
+      "name": "pull_mapped",
+      "extra": {
+        "transfer_mode": "pull",
+        "data_path": "mapped"
+      }
+    },
+    {
+      "name": "pull_staged",
+      "extra": {
+        "transfer_mode": "pull",
+        "data_path": "staged"
+      }
+    },
+    {
+      "name": "push_mapped",
+      "extra": {
+        "transfer_mode": "push",
+        "data_path": "mapped"
+      }
+    },
+    {
+      "name": "push_staged",
+      "extra": {
+        "transfer_mode": "push",
+        "data_path": "staged"
+      }
+    }
+  ]
+}

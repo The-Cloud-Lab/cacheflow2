@@ -1,0 +1,73 @@
+{
+  "name": "staging",
+  "description": "Sensitivity to staging resources (copy streams matter on the staged path).",
+  "model": "Qwen/Qwen3-4B",
+  "server_host": "10.0.1.2",
+  "port": 8100,
+  "vllm_args": [
+    "--max-model-len",
+    "32000",
+    "--gpu-memory-utilization",
+    "0.3"
+  ],
+  "workload": {
+    "prefix_len": 20000,
+    "suffix_len": 0,
+    "num_prefixes": 10,
+    "output_len": 100,
+    "num_prompts": 100,
+    "burstiness": 1.0,
+    "seed": 0
+  },
+  "request_rates": [
+    4
+  ],
+  "variants": [
+    {
+      "name": "streams_1",
+      "extra": {
+        "data_path": "staged",
+        "copy_stream_pool_size": 1
+      }
+    },
+    {
+      "name": "streams_2",
+      "extra": {
+        "data_path": "staged",
+        "copy_stream_pool_size": 2
+      }
+    },
+    {
+      "name": "streams_4",
+      "extra": {
+        "data_path": "staged",
+        "copy_stream_pool_size": 4
+      }
+    },
+    {
+      "name": "streams_8",
+      "extra": {
+        "data_path": "staged",
+        "copy_stream_pool_size": 8
+      }
+    },
+    {
+      "name": "staging_3gb",
+      "extra": {
+        "staging_pool_gb": 3
+      }
+    },
+    {
+      "name": "staging_6gb",
+      "extra": {
+        "staging_pool_gb": 6
+      }
+    },
+    {
+      "name": "staging_12gb",
+      "extra": {
+        "staging_pool_gb": 12
+      }
+    }
+  ]
+}

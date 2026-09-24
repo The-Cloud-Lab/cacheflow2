@@ -1,0 +1,21 @@
+{
+    "kv_connector": "CacheFlowConnectorV3",
+    "kv_connector_module_path": "cacheflowv3.connector",
+    "kv_role": "kv_both",
+    "kv_load_failure_policy": "recompute",
+    "kv_connector_extra_config": {
+        "server_host": "10.0.1.2",
+        "server_port": 18515,
+        "chunk_tokens": 256,
+        "transfer_mode": "pull",
+        "data_path": "mapped",
+        "layerwise_load": true,
+        "async_transfers": true,
+        "overlap_dma_with_copy": true,
+        "use_registered_buffer_pool": true,
+        "skip_save_if_prefix_cached": true,
+        "staging_pool_gb": 4,
+        "copy_stream_pool_size": 4,
+        "reset_dpu_cache_on_start": false
+    }
+}

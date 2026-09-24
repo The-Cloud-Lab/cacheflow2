@@ -207,3 +207,11 @@ KVConnectorFactory.register_connector(
     "vllm.distributed.kv_transfer.kv_connector.v1.cacheflow_connector",
     "CacheFlowConnectorV1",
 )
+
+# CacheFlow v3 (BlueField-3 pool over RDMA) lives out of tree in cacheflowv3/;
+# stock vLLM loads it via kv_connector_module_path="cacheflowv3.connector".
+KVConnectorFactory.register_connector(
+    "CacheFlowConnectorV3",
+    "cacheflowv3.connector",
+    "CacheFlowConnectorV3",
+)

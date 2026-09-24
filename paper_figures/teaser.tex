@@ -1,0 +1,15 @@
+% Place directly after \end{abstract} so it lands on page 1.
+\begin{figure}[h!]
+  \centering
+  \includegraphics[width=\textwidth]{figures/teaser.pdf}
+  \vspace{-1.5em}
+  \caption{\textbf{Replicating the same agent prompts on every GPU wastes memory and prefill compute.}
+  (a)~Memory needed to cache ten 20K-token agent prompts when $N$ GPUs serve the same agents
+  (Llama-3.2-3B, BF16 KV, Eq.~\ref{eq:kvsize}): vLLM keeps a copy on every GPU, whereas CacheFlow
+  keeps one shared copy on the SmartNIC.
+  (b)~Mean TTFT for Qwen3-4B at QPS\,=\,1.
+  (c)~Total token throughput averaged over QPS 1--10; percentages are relative to vLLM.
+  (b) and (c) are measured values from Table~\ref{tab:main}.}
+  \label{fig:teaser}
+  \vspace{-1em}
+\end{figure}

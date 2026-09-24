@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cacheflowv3"
+version = "3.0.0"
+description = "CacheFlow v3: BlueField-3 network-attached prefix KV cache pool for vLLM"
+requires-python = ">=3.10"
+dependencies = ["numpy"]
+
+[project.optional-dependencies]
+# vLLM side (the BF3 server needs only numpy + libcfrdma)
+vllm = ["vllm", "torch", "xxhash"]
+test = ["pytest"]
+
+[project.scripts]
+cacheflowv3-server = "cacheflowv3.server.__main__:main"
+cfctl = "cacheflowv3.tools.cfctl:main"
+
+[tool.setuptools.packages.find]
+include = ["cacheflowv3*"]
+
+[tool.setuptools.package-data]
+cacheflowv3 = ["lib/*.so"]

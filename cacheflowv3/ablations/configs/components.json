@@ -1,0 +1,71 @@
+{
+  "name": "components",
+  "description": "Leave-one-out ablation of CacheFlow's optimizations (Section 3.3).",
+  "model": "Qwen/Qwen3-4B",
+  "server_host": "10.0.1.2",
+  "port": 8100,
+  "vllm_args": [
+    "--max-model-len",
+    "32000",
+    "--gpu-memory-utilization",
+    "0.3"
+  ],
+  "workload": {
+    "prefix_len": 20000,
+    "suffix_len": 0,
+    "num_prefixes": 10,
+    "output_len": 100,
+    "num_prompts": 100,
+    "burstiness": 1.0,
+    "seed": 0
+  },
+  "request_rates": [
+    1,
+    4
+  ],
+  "variants": [
+    {
+      "name": "full"
+    },
+    {
+      "name": "no_buffer_pool",
+      "extra": {
+        "use_registered_buffer_pool": false
+      }
+    },
+    {
+      "name": "no_save_overlap",
+      "extra": {
+        "overlap_dma_with_copy": false
+      }
+    },
+    {
+      "name": "sync_saves",
+      "extra": {
+        "async_transfers": false
+      }
+    },
+    {
+      "name": "no_layerwise_load",
+      "extra": {
+        "layerwise_load": false
+      }
+    },
+    {
+      "name": "no_dedup",
+      "extra": {
+        "skip_save_if_prefix_cached": false
+      }
+    },
+    {
+      "name": "none",
+      "extra": {
+        "use_registered_buffer_pool": false,
+        "overlap_dma_with_copy": false,
+        "async_transfers": false,
+        "layerwise_load": false,
+        "skip_save_if_prefix_cached": false
+      }
+    }
+  ]
+}

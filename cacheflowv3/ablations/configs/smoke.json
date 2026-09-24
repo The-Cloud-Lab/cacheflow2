@@ -1,0 +1,38 @@
+{
+  "name": "smoke",
+  "description": "Tiny end-to-end check of the ablation runner (minutes, small model).",
+  "model": "Qwen/Qwen3-0.6B",
+  "server_host": "10.0.1.2",
+  "port": 8100,
+  "vllm_args": [
+    "--max-model-len",
+    "8192",
+    "--gpu-memory-utilization",
+    "0.12"
+  ],
+  "workload": {
+    "prefix_len": 3000,
+    "suffix_len": 0,
+    "num_prefixes": 4,
+    "output_len": 16,
+    "num_prompts": 16,
+    "burstiness": 1.0,
+    "seed": 0
+  },
+  "request_rates": [
+    2
+  ],
+  "variants": [
+    {
+      "name": "vllm",
+      "system": "vllm"
+    },
+    {
+      "name": "cacheflow"
+    },
+    {
+      "name": "cacheflow_warm_restart",
+      "prewarm": true
+    }
+  ]
+}

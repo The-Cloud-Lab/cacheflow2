@@ -1,0 +1,56 @@
+{
+  "name": "main",
+  "description": "Paper Table 1: vanilla vLLM vs LMCache vs CacheFlow v3 over request rate. LMCache needs `pip install lmcache` in the vLLM environment.",
+  "model": "Qwen/Qwen3-4B",
+  "server_host": "10.0.1.2",
+  "port": 8100,
+  "vllm_args": [
+    "--max-model-len",
+    "32000",
+    "--gpu-memory-utilization",
+    "0.3"
+  ],
+  "workload": {
+    "prefix_len": 20000,
+    "suffix_len": 0,
+    "num_prefixes": 10,
+    "output_len": 100,
+    "num_prompts": 100,
+    "burstiness": 1.0,
+    "seed": 0
+  },
+  "request_rates": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10
+  ],
+  "variants": [
+    {
+      "name": "vllm",
+      "system": "vllm"
+    },
+    {
+      "name": "lmcache",
+      "system": "custom",
+      "kv_transfer_config": {
+        "kv_connector": "LMCacheConnectorV1",
+        "kv_role": "kv_both"
+      },
+      "env": {
+        "LMCACHE_LOCAL_CPU": "True",
+        "LMCACHE_MAX_LOCAL_CPU_SIZE": "20",
+        "LMCACHE_CHUNK_SIZE": "256"
+      }
+    },
+    {
+      "name": "cacheflow"
+    }
+  ]
+}
